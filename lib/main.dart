@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -635,6 +637,78 @@ class NetworksPage extends StatelessWidget {
   final VoidCallback onCreate;
   final Future<void> Function() onChanged;
 
+  Future<void> importNetForgeFile(BuildContext context) async {
+    try {
+      final picked = await openFile(
+        acceptedTypeGroups: const [
+          XTypeGroup(
+            label: 'NetForge network',
+            extensions: ['netforge', 'json'],
+            mimeTypes: ['application/json'],
+          ),
+        ],
+      );
+      if (picked == null || !context.mounted) return;
+      final incoming = parseNetForgeFile(await picked.readAsString());
+      if (!context.mounted) return;
+      final existingIndex = networks.indexWhere(
+        (network) => network.id == incoming.id,
+      );
+      var imported = incoming;
+      if (existingIndex >= 0) {
+        final choice = await showDialog<String>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Network already exists'),
+            content: Text(
+              '“${incoming.name}” is already saved on this device. Replace it '
+              'with the imported copy or keep both?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('CANCEL'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, 'copy'),
+                child: const Text('KEEP BOTH'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, 'replace'),
+                child: const Text('REPLACE'),
+              ),
+            ],
+          ),
+        );
+        if (choice == null || !context.mounted) return;
+        if (choice == 'replace') {
+          networks[existingIndex] = incoming;
+        } else {
+          imported = NetworkMap.fromJson({
+            ...incoming.toJson(),
+            'id': DateTime.now().microsecondsSinceEpoch.toString(),
+            'name': '${incoming.name} (imported)',
+          });
+          networks.insert(0, imported);
+        }
+      } else {
+        networks.insert(0, imported);
+      }
+      await onChanged();
+      if (context.mounted) onOpen(imported);
+    } on FormatException catch (exception) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Import failed: ${exception.message}')),
+      );
+    } catch (exception) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open that NetForge file.')),
+      );
+    }
+  }
+
   Future<void> importNotes(BuildContext context) async {
     final controller = TextEditingController();
     final result = await showModalBottomSheet<_ImportResult>(
@@ -746,6 +820,15 @@ class NetworksPage extends StatelessWidget {
               ),
             ),
           ],
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: () => importNetForgeFile(context),
+            icon: const Icon(Icons.file_open_outlined),
+            label: const Text('IMPORT .NETFORGE FILE'),
+          ),
         ),
         const SizedBox(height: 22),
         SavedNetworksList(
@@ -1195,6 +1278,8 @@ class NetworkWorkspace extends StatefulWidget {
 }
 
 class _NetworkWorkspaceState extends State<NetworkWorkspace> {
+  static const deviceChannel = MethodChannel('netforge/device_status');
+
   final refreshed = <String, ScannedHost>{};
   final missing = <String>{};
   final ignored = <String>{};
@@ -1445,9 +1530,8 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
 
   Future<void> exportNetwork() async {
     final readable = exportNetworkText(widget.network);
-    final json = const JsonEncoder.withIndent(
-      '  ',
-    ).convert(widget.network.toJson());
+    final json = portableNetworkJson(widget.network);
+    final fileName = netForgeFileName(widget.network);
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -1468,6 +1552,23 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                 child: SingleChildScrollView(child: SelectableText(readable)),
               ),
               const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: () async {
+                    final saved = await saveNetForgeFile(fileName, json);
+                    if (!saved || !context.mounted) return;
+                    Navigator.pop(context);
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(
+                      this.context,
+                    ).showSnackBar(SnackBar(content: Text('Saved $fileName')));
+                  },
+                  icon: const Icon(Icons.save_alt_rounded),
+                  label: const Text('SAVE .NETFORGE FILE'),
+                ),
+              ),
+              const SizedBox(height: 10),
               Row(
                 children: [
                   Expanded(
@@ -1494,6 +1595,25 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
         ),
       ),
     );
+  }
+
+  Future<bool> saveNetForgeFile(String fileName, String content) async {
+    if (Platform.isAndroid) {
+      return await deviceChannel.invokeMethod<bool>('saveNetForgeFile', {
+            'name': fileName,
+            'content': content,
+          }) ??
+          false;
+    }
+    final location = await getSaveLocation(suggestedName: fileName);
+    if (location == null) return false;
+    final file = XFile.fromData(
+      Uint8List.fromList(utf8.encode(content)),
+      mimeType: 'application/json',
+      name: fileName,
+    );
+    await file.saveTo(location.path);
+    return true;
   }
 
   @override
@@ -2040,9 +2160,317 @@ class MappingToolsPage extends StatelessWidget {
           subtitle: 'Calculate an IPv4 network range',
           onTap: () => showSubnetCalculator(context),
         ),
+        ToolTile(
+          icon: Icons.system_update_rounded,
+          title: 'Updates',
+          subtitle: 'Check GitHub for a newer NetForge release',
+          onTap: () => Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const UpdatesPage()),
+          ),
+        ),
       ],
     ),
   );
+}
+
+class NetForgeRelease {
+  const NetForgeRelease({
+    required this.version,
+    required this.name,
+    required this.notes,
+    required this.pageUrl,
+    this.apkUrl,
+    this.linuxUrl,
+  });
+
+  final String version;
+  final String name;
+  final String notes;
+  final String pageUrl;
+  final String? apkUrl;
+  final String? linuxUrl;
+
+  factory NetForgeRelease.fromJson(Map<String, dynamic> json) {
+    final assets = json['assets'] as List<dynamic>? ?? const [];
+    String? apkUrl;
+    String? linuxUrl;
+    for (final value in assets) {
+      final asset = value as Map<String, dynamic>;
+      final name = asset['name'] as String? ?? '';
+      final url = asset['browser_download_url'] as String? ?? '';
+      if (name.toLowerCase().endsWith('.apk') &&
+          url.startsWith(
+            'https://github.com/indiCa8250/NetForge/releases/download/',
+          )) {
+        apkUrl = url;
+      }
+      if ((name.toLowerCase().endsWith('.appimage') ||
+              name.toLowerCase().endsWith('.deb')) &&
+          url.startsWith(
+            'https://github.com/indiCa8250/NetForge/releases/download/',
+          )) {
+        linuxUrl = url;
+      }
+    }
+    return NetForgeRelease(
+      version: (json['tag_name'] as String? ?? '').replaceFirst(
+        RegExp(r'^[vV]'),
+        '',
+      ),
+      name: json['name'] as String? ?? 'NetForge update',
+      notes: json['body'] as String? ?? '',
+      pageUrl:
+          json['html_url'] as String? ??
+          'https://github.com/indiCa8250/NetForge/releases',
+      apkUrl: apkUrl,
+      linuxUrl: linuxUrl,
+    );
+  }
+}
+
+List<int> versionParts(String value) => value
+    .split(RegExp(r'[.+-]'))
+    .take(3)
+    .map((part) => int.tryParse(part) ?? 0)
+    .toList();
+
+bool isNewerVersion(String latest, String current) {
+  final latestParts = versionParts(latest);
+  final currentParts = versionParts(current);
+  for (var index = 0; index < 3; index++) {
+    final left = index < latestParts.length ? latestParts[index] : 0;
+    final right = index < currentParts.length ? currentParts[index] : 0;
+    if (left != right) return left > right;
+  }
+  return false;
+}
+
+class UpdatesPage extends StatefulWidget {
+  const UpdatesPage({super.key});
+
+  @override
+  State<UpdatesPage> createState() => _UpdatesPageState();
+}
+
+class _UpdatesPageState extends State<UpdatesPage> {
+  static const channel = MethodChannel('netforge/device_status');
+  static const releasesUrl = 'https://github.com/indiCa8250/NetForge/releases';
+  static const latestApiUrl =
+      'https://api.github.com/repos/indiCa8250/NetForge/releases/latest';
+
+  String currentVersion = '';
+  NetForgeRelease? release;
+  bool loading = true;
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    check();
+  }
+
+  Future<void> check() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    final client = HttpClient();
+    try {
+      final package = await PackageInfo.fromPlatform();
+      final request = await client.getUrl(Uri.parse(latestApiUrl));
+      request.headers
+        ..set(HttpHeaders.acceptHeader, 'application/vnd.github+json')
+        ..set(HttpHeaders.userAgentHeader, 'NetForge/${package.version}');
+      final response = await request.close();
+      if (response.statusCode == HttpStatus.notFound) {
+        throw const HttpException(
+          'No NetForge release has been published yet.',
+        );
+      }
+      if (response.statusCode != HttpStatus.ok) {
+        throw HttpException('GitHub returned status ${response.statusCode}.');
+      }
+      final body = await utf8.decoder.bind(response).join();
+      final latest = NetForgeRelease.fromJson(
+        jsonDecode(body) as Map<String, dynamic>,
+      );
+      if (!mounted) return;
+      setState(() {
+        currentVersion = package.version;
+        release = latest;
+        loading = false;
+      });
+    } catch (exception) {
+      if (!mounted) return;
+      setState(() {
+        error = exception is HttpException
+            ? exception.message
+            : 'Could not check GitHub for updates.';
+        loading = false;
+      });
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> openUpdate(String url) async {
+    try {
+      final approved = url.startsWith(
+        'https://github.com/indiCa8250/NetForge/',
+      );
+      if (!approved) throw const FormatException('Invalid update link.');
+      if (Platform.isAndroid) {
+        await channel.invokeMethod<void>('openUrl', {'url': url});
+      } else if (Platform.isLinux) {
+        final result = await Process.run('xdg-open', [url]);
+        if (result.exitCode != 0) {
+          throw ProcessException('xdg-open', [url]);
+        }
+      } else {
+        throw UnsupportedError('Updates are not supported here.');
+      }
+    } catch (exception) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open the update link.')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final latest = release;
+    final updateAvailable =
+        latest != null &&
+        currentVersion.isNotEmpty &&
+        isNewerVersion(latest.version, currentVersion);
+    final downloadUrl = latest == null
+        ? null
+        : Platform.isAndroid
+        ? latest.apkUrl
+        : Platform.isLinux
+        ? latest.linuxUrl
+        : null;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('NetForge updates'),
+        actions: [
+          IconButton(
+            onPressed: loading ? null : check,
+            tooltip: 'Check again',
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          const Icon(Icons.system_update_rounded, color: accent, size: 52),
+          const SizedBox(height: 14),
+          const Text(
+            'NetForge updates',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            currentVersion.isEmpty
+                ? 'Checking the installed version…'
+                : 'Installed version $currentVersion',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: secondary),
+          ),
+          if (loading) ...[
+            const SizedBox(height: 24),
+            const LinearProgressIndicator(
+              color: accent,
+              backgroundColor: border,
+            ),
+          ] else if (error != null) ...[
+            const SizedBox(height: 24),
+            Text(
+              error!,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: warning),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: check,
+              icon: const Icon(Icons.refresh_rounded),
+              label: const Text('CHECK AGAIN'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () => openUpdate(releasesUrl),
+              icon: const Icon(Icons.open_in_browser_rounded),
+              label: const Text('OPEN GITHUB RELEASES'),
+            ),
+          ] else if (latest != null) ...[
+            const SizedBox(height: 24),
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: surface,
+                border: Border.all(color: updateAvailable ? accent : border),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    updateAvailable ? 'UPDATE AVAILABLE' : 'YOU ARE UP TO DATE',
+                    style: TextStyle(
+                      color: updateAvailable ? accent : secondary,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '${latest.name} · ${latest.version}',
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  if (latest.notes.trim().isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    Text(
+                      latest.notes.trim(),
+                      style: const TextStyle(color: secondary),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              onPressed: () => openUpdate(downloadUrl ?? latest.pageUrl),
+              icon: const Icon(Icons.download_rounded),
+              label: Text(
+                downloadUrl == null
+                    ? 'OPEN RELEASE'
+                    : Platform.isAndroid
+                    ? 'DOWNLOAD APK'
+                    : 'DOWNLOAD LINUX APP',
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              Platform.isAndroid
+                  ? 'Android will ask you to approve installation. Updates '
+                        'must use the same release signing key.'
+                  : 'Download and install the Linux release package. Your '
+                        'saved networks remain stored locally.',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: secondary, fontSize: 11),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 }
 
 class NearbyAccessPoint {
@@ -2696,6 +3124,39 @@ bool samePorts(List<int> a, List<int> b) =>
     a.toSet().length == b.toSet().length && a.toSet().containsAll(b);
 
 int lastOctet(String ip) => int.tryParse(ip.split('.').last) ?? 0;
+
+String portableNetworkJson(NetworkMap network) =>
+    const JsonEncoder.withIndent('  ').convert({
+      'format': 'netforge.network',
+      'version': 1,
+      'exportedAt': DateTime.now().toUtc().toIso8601String(),
+      'network': network.toJson(),
+    });
+
+NetworkMap parseNetForgeFile(String contents) {
+  try {
+    final document = jsonDecode(contents);
+    if (document is! Map<String, dynamic> ||
+        document['format'] != 'netforge.network' ||
+        document['version'] != 1 ||
+        document['network'] is! Map<String, dynamic>) {
+      throw const FormatException('This is not a supported .netforge file.');
+    }
+    return NetworkMap.fromJson(document['network'] as Map<String, dynamic>);
+  } on FormatException {
+    rethrow;
+  } catch (_) {
+    throw const FormatException('The .netforge file is damaged or incomplete.');
+  }
+}
+
+String netForgeFileName(NetworkMap network) {
+  final safeName = network.name
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+      .replaceAll(RegExp(r'^-+|-+$'), '');
+  return '${safeName.isEmpty ? 'network' : safeName}.netforge';
+}
 
 String exportNetworkText(NetworkMap network) {
   final output = StringBuffer()

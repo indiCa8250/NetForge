@@ -107,6 +107,37 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(text, contains('5555'));
   });
 
+  test('portable NetForge file round-trips the complete network', () {
+    final original = NetworkMap(
+      id: 'portable-lab',
+      name: 'Portable Lab',
+      ssid: 'Lab WiFi',
+      notes: 'Transfer between Android and Linux',
+      devices: [
+        DeviceRecord(
+          ip: '10.0.0.8',
+          name: 'Server',
+          mac: 'AA:BB:CC:DD:EE:FF',
+          ports: [22, 443],
+        ),
+      ],
+    );
+
+    final file = portableNetworkJson(original);
+    final restored = parseNetForgeFile(file);
+
+    expect(restored.id, original.id);
+    expect(restored.name, original.name);
+    expect(restored.ssid, original.ssid);
+    expect(restored.devices.single.name, 'Server');
+    expect(restored.devices.single.ports, [22, 443]);
+    expect(netForgeFileName(original), 'portable-lab.netforge');
+    expect(
+      () => parseNetForgeFile('{"network":{}}'),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
   test('live IP findings merge globally without changing saved networks', () {
     final saved = DeviceRecord(
       ip: '192.168.1.25',
@@ -149,6 +180,34 @@ Phone 192.168.1.55 ports: 5555,8080
       0,
     );
     expect(network.devices, hasLength(2));
+  });
+
+  test('GitHub release parser finds APK and compares versions', () {
+    final release = NetForgeRelease.fromJson({
+      'tag_name': 'v1.2.0',
+      'name': 'NetForge 1.2.0',
+      'body': 'New tools',
+      'html_url': 'https://github.com/indiCa8250/NetForge/releases/tag/v1.2.0',
+      'assets': [
+        {
+          'name': 'netforge.apk',
+          'browser_download_url':
+              'https://github.com/indiCa8250/NetForge/releases/download/v1.2.0/netforge.apk',
+        },
+        {
+          'name': 'netforge-linux.AppImage',
+          'browser_download_url':
+              'https://github.com/indiCa8250/NetForge/releases/download/v1.2.0/netforge-linux.AppImage',
+        },
+      ],
+    });
+
+    expect(release.version, '1.2.0');
+    expect(release.apkUrl, endsWith('/netforge.apk'));
+    expect(release.linuxUrl, endsWith('/netforge-linux.AppImage'));
+    expect(isNewerVersion(release.version, '1.1.9'), isTrue);
+    expect(isNewerVersion(release.version, '1.2.0'), isFalse);
+    expect(isNewerVersion('1.1.9', release.version), isFalse);
   });
 
   testWidgets('port scanner uses LAN and discovered IP dropdown', (

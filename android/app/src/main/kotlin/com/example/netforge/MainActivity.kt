@@ -26,7 +26,10 @@ import java.net.NetworkInterface
 class MainActivity : FlutterActivity() {
     private val channelName = "netforge/device_status"
     private val permissionRequestCode = 7412
+    private val saveNetworkRequestCode = 7413
     private var pendingPermissionResult: MethodChannel.Result? = null
+    private var pendingSaveResult: MethodChannel.Result? = null
+    private var pendingSaveContent: String? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -36,6 +39,40 @@ class MainActivity : FlutterActivity() {
                     "getStatus" -> result.success(readStatus())
                     "requestPermissions" -> requestStatusPermissions(result)
                     "getNearbyAccessPoints" -> getNearbyAccessPoints(result)
+                    "openUrl" -> {
+                        val url = call.argument<String>("url")
+                        if (url == null ||
+                            (!url.startsWith("https://github.com/indiCa8250/NetForge/") &&
+                                !url.startsWith(
+                                    "https://api.github.com/repos/indiCa8250/NetForge/",
+                                ))
+                        ) {
+                            result.error("invalid_url", "This link is not a NetForge update.", null)
+                        } else {
+                            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                            result.success(null)
+                        }
+                    }
+                    "saveNetForgeFile" -> {
+                        val name = call.argument<String>("name")
+                        val content = call.argument<String>("content")
+                        if (name.isNullOrBlank() || content == null) {
+                            result.error("invalid_file", "The network export is invalid.", null)
+                        } else if (pendingSaveResult != null) {
+                            result.error("save_pending", "A save window is already open.", null)
+                        } else {
+                            pendingSaveResult = result
+                            pendingSaveContent = content
+                            startActivityForResult(
+                                Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                    addCategory(Intent.CATEGORY_OPENABLE)
+                                    type = "application/json"
+                                    putExtra(Intent.EXTRA_TITLE, name)
+                                },
+                                saveNetworkRequestCode,
+                            )
+                        }
+                    }
                     "openLocationSettings" -> {
                         startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
                         result.success(null)
@@ -43,6 +80,27 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != saveNetworkRequestCode) return
+        val result = pendingSaveResult
+        val content = pendingSaveContent
+        pendingSaveResult = null
+        pendingSaveContent = null
+        if (resultCode != RESULT_OK || data?.data == null || content == null) {
+            result?.success(false)
+            return
+        }
+        try {
+            contentResolver.openOutputStream(data.data!!)?.bufferedWriter().use { writer ->
+                writer?.write(content)
+            }
+            result?.success(true)
+        } catch (exception: Exception) {
+            result?.error("save_failed", exception.message ?: "Could not save network.", null)
+        }
     }
 
     @Suppress("DEPRECATION", "MissingPermission")
