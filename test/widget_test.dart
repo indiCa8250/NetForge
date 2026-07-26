@@ -171,6 +171,36 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(parsePorts('0,65536,nope'), isEmpty);
   });
 
+  test('neighbor MAC parser supports Linux, macOS, and Windows output', () {
+    final parsed = parseNeighborMacs('''
+192.168.1.1 dev wlan0 lladdr aa:bb:cc:dd:ee:01 REACHABLE
+? (192.168.1.20) at AA:BB:CC:DD:EE:20 on en0 ifscope
+  192.168.1.30          11-22-33-44-55-66     dynamic
+192.168.1.40 dev wlan0 INCOMPLETE
+192.168.1.50 dev wlan0 lladdr 00:00:00:00:00:00 STALE
+192.168.1.60 dev wlan0 lladdr ff:ff:ff:ff:ff:ff STALE
+''');
+
+    expect(parsed, {
+      '192.168.1.1': 'AA:BB:CC:DD:EE:01',
+      '192.168.1.20': 'AA:BB:CC:DD:EE:20',
+      '192.168.1.30': '11:22:33:44:55:66',
+    });
+  });
+
+  test('port observations retain the previously discovered identity', () {
+    final merged = mergePortScanObservation(
+      const ScannedHost('192.168.1.20', '192.168.1.20', [22, 443]),
+      previous: const ScannedHost('192.168.1.20', 'printer.local', [
+        80,
+      ], mac: 'AA:BB:CC:DD:EE:FF'),
+    );
+
+    expect(merged.hostname, 'printer.local');
+    expect(merged.mac, 'AA:BB:CC:DD:EE:FF');
+    expect(merged.ports, [22, 443]);
+  });
+
   test('DNS lookup failures distinguish missing reverse DNS', () {
     expect(
       dnsLookupFailureMessage('192.168.4.30'),
@@ -350,6 +380,7 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(find.byType(DeviceTile), findsOneWidget);
     expect(find.text('Web-enabled device'), findsOneWidget);
     expect(find.text('192.168.4.30'), findsOneWidget);
+    expect(find.text('AA:BB:CC:DD:EE:FF'), findsOneWidget);
     expect(
       find.byTooltip('Refresh listed ports for 192.168.4.30'),
       findsOneWidget,
@@ -357,7 +388,7 @@ Phone 192.168.1.55 ports: 5555,8080
 
     await tester.tap(find.text('Web-enabled device'));
     await tester.pumpAndSettle();
-    expect(find.text('AA:BB:CC:DD:EE:FF'), findsOneWidget);
+    expect(find.text('AA:BB:CC:DD:EE:FF'), findsNWidgets(2));
     expect(find.text('REFRESH LISTED PORTS / CHECK ALIVE'), findsOneWidget);
     expect(find.text('PORT SCANNER'), findsOneWidget);
     await tester.tapAt(const Offset(5, 5));
@@ -430,6 +461,29 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(first.devices.single.ports, [80]);
     expect(second.devices, hasLength(2));
   });
+
+  test(
+    'network merge backfills a same-IP device MAC without duplicating it',
+    () {
+      final target = NetworkMap(
+        id: 'home',
+        name: 'Home',
+        devices: [DeviceRecord(ip: '192.168.1.20', name: 'Printer')],
+      );
+
+      mergeDevicesInto(target, [
+        DeviceRecord(
+          ip: '192.168.1.20',
+          mac: 'aa-bb-cc-dd-ee-ff',
+          ports: [80, 9100],
+        ),
+      ]);
+
+      expect(target.devices, hasLength(1));
+      expect(target.devices.single.mac, 'AA:BB:CC:DD:EE:FF');
+      expect(target.devices.single.ports, [80, 9100]);
+    },
+  );
 
   test('GitHub release parser finds APK and compares versions', () {
     final release = NetForgeRelease.fromJson({
@@ -653,6 +707,90 @@ Phone 192.168.1.55 ports: 5555,8080
     await tester.pumpAndSettle();
 
     expect(find.text('Edited LAN'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'saved device rename closes without using a disposed controller',
+    (tester) async {
+      final device = DeviceRecord(ip: '192.168.1.10', name: 'Old name');
+      var saveCalls = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: NetworkWorkspace(
+            network: NetworkMap(
+              id: 'home',
+              name: 'Home LAN',
+              devices: [device],
+            ),
+            liveInventory: LiveInventory(),
+            onChanged: () async => saveCalls++,
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('Old name'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Old name').last);
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Device name'),
+        'New name',
+      );
+      await tester.tap(find.text('SAVE'));
+      await tester.pumpAndSettle();
+
+      expect(device.name, 'New name');
+      expect(saveCalls, 1);
+      expect(find.text('New name'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('a discovered MAC is visible and can be saved explicitly', (
+    tester,
+  ) async {
+    final device = DeviceRecord(ip: '192.168.1.20', name: 'Printer');
+    var applied = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () => showDevice(
+                context,
+                device,
+                fresh: const ScannedHost('192.168.1.20', 'printer.local', [
+                  80,
+                  9100,
+                ], mac: 'AA:BB:CC:DD:EE:FF'),
+                onApplyMac: () {
+                  device.mac = 'AA:BB:CC:DD:EE:FF';
+                  applied = true;
+                },
+                onScanAllPorts: () {},
+              ),
+              child: const Text('OPEN DEVICE'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('OPEN DEVICE'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Not documented'), findsOneWidget);
+    expect(
+      find.textContaining('DISCOVERED MAC\nAA:BB:CC:DD:EE:FF'),
+      findsOneWidget,
+    );
+    expect(find.text('SAVE DISCOVERED MAC'), findsOneWidget);
+
+    await tester.tap(find.text('SAVE DISCOVERED MAC'));
+    await tester.pumpAndSettle();
+    expect(applied, isTrue);
+    expect(device.mac, 'AA:BB:CC:DD:EE:FF');
     expect(tester.takeException(), isNull);
   });
 

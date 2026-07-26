@@ -188,21 +188,32 @@ void mergeDevicesInto(
   Iterable<DeviceRecord> incomingDevices,
 ) {
   for (final incoming in incomingDevices) {
-    final normalizedMac = incoming.mac.trim().toUpperCase();
-    final index = target.devices.indexWhere((existing) {
-      final existingMac = existing.mac.trim().toUpperCase();
-      if (normalizedMac.isNotEmpty) return existingMac == normalizedMac;
-      return existing.ip == incoming.ip;
-    });
+    final normalizedMac = normalizeMacAddress(incoming.mac);
+    var index = normalizedMac.isEmpty
+        ? -1
+        : target.devices.indexWhere(
+            (existing) => normalizeMacAddress(existing.mac) == normalizedMac,
+          );
     if (index < 0) {
-      target.devices.add(DeviceRecord.fromJson(incoming.toJson()));
+      index = target.devices.indexWhere((existing) {
+        if (existing.ip != incoming.ip) return false;
+        final existingMac = normalizeMacAddress(existing.mac);
+        return existingMac.isEmpty || normalizedMac.isEmpty;
+      });
+    }
+    if (index < 0) {
+      final copy = DeviceRecord.fromJson(incoming.toJson());
+      if (isUsableMacAddress(normalizedMac)) copy.mac = normalizedMac;
+      target.devices.add(copy);
       continue;
     }
     final existing = target.devices[index];
     final mergedPorts = {...existing.ports, ...incoming.ports}.toList()..sort();
     existing.ports = mergedPorts;
     if (existing.name.isEmpty) existing.name = incoming.name;
-    if (existing.mac.isEmpty) existing.mac = incoming.mac;
+    if (existing.mac.isEmpty && isUsableMacAddress(normalizedMac)) {
+      existing.mac = normalizedMac;
+    }
     if (existing.product.isEmpty ||
         existing.product == 'Reachable network device') {
       existing.product = incoming.product;
@@ -2538,6 +2549,12 @@ class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
               onPing: () => checkResultAlive(host),
             );
           }),
+          if (results.any((host) => !isUsableMacAddress(host.mac)))
+            MacDiscoveryNotice(
+              unresolvedCount: results
+                  .where((host) => !isUsableMacAddress(host.mac))
+                  .length,
+            ),
         ],
         if (!scanning && checked > 0 && results.isEmpty && error == null)
           const EmptyMessage(
@@ -2666,34 +2683,11 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
   }
 
   Future<void> renameDevice(DeviceRecord device) async {
-    final controller = TextEditingController(text: device.name);
     final name = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Name this device'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: 'Device name',
-            hintText: 'Office printer',
-          ),
-          onSubmitted: (value) => Navigator.pop(context, value.trim()),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('CANCEL'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('SAVE'),
-          ),
-        ],
-      ),
+      builder: (context) => _DeviceNameDialog(initialName: device.name),
     );
-    controller.dispose();
-    if (name == null || name.isEmpty) return;
+    if (!mounted || name == null || name.isEmpty) return;
     device.name = name;
     await changed();
   }
@@ -2817,7 +2811,11 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
           onResults: (result) {
             if (!mounted) return;
             setState(() {
-              refreshed[device.ip] = result;
+              refreshed[device.ip] = mergePortScanObservation(
+                result,
+                previous: refreshed[device.ip],
+                saved: device,
+              );
               missing.remove(device.ip);
             });
           },
@@ -2926,6 +2924,9 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
     final markedActiveButOffline = widget.network.devices.where(
       (device) => !device.isDead && missing.contains(device.ip),
     );
+    final unresolvedMacs = refreshed.values
+        .where((host) => !isUsableMacAddress(host.mac))
+        .length;
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.network.name),
@@ -2998,6 +2999,8 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
               '${active.length} saved active · ${missing.length} missing · ${newHosts.length} new',
               style: const TextStyle(color: secondary, fontSize: 12),
             ),
+            if (unresolvedMacs > 0)
+              MacDiscoveryNotice(unresolvedCount: unresolvedMacs),
           ],
           if (markedInactiveButLive.isNotEmpty ||
               markedActiveButOffline.isNotEmpty) ...[
@@ -3044,7 +3047,9 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                 color: accent,
                 title: host.ip,
                 subtitle:
-                    '${host.hostname.isEmpty ? 'Unknown device' : host.hostname} · ${host.ports.length} open ports',
+                    '${host.hostname.isEmpty ? 'Unknown device' : host.hostname}'
+                    ' · ${host.ports.length} open ports'
+                    '${host.mac.isEmpty ? '' : ' · ${normalizeMacAddress(host.mac)}'}',
                 primary: 'KEEP',
                 secondary: 'IGNORE',
                 onPrimary: () async {
@@ -3069,11 +3074,16 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
               final fresh = refreshed[device.ip];
               final portsChanged =
                   fresh != null && !samePorts(device.ports, fresh.ports);
+              final macChanged =
+                  fresh != null &&
+                  isUsableMacAddress(fresh.mac) &&
+                  normalizeMacAddress(fresh.mac) !=
+                      normalizeMacAddress(device.mac);
               final status = device.isDead
                   ? DeviceStatus.dead
                   : isMissing
                   ? DeviceStatus.missing
-                  : portsChanged
+                  : portsChanged || macChanged
                   ? DeviceStatus.changed
                   : fresh != null
                   ? DeviceStatus.active
@@ -3123,6 +3133,7 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                 },
                 child: DeviceTile(
                   device: device,
+                  observedMac: fresh?.mac ?? '',
                   status: status,
                   onTools: () => openDeviceTools(device),
                   onTap: () => showDevice(
@@ -3142,6 +3153,22 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                             device
                               ..ports = mergedPorts
                               ..lastSeen = DateTime.now();
+                            await changed();
+                          },
+                    onApplyMac: !macChanged
+                        ? null
+                        : () async {
+                            device
+                              ..mac = normalizeMacAddress(fresh.mac)
+                              ..lastSeen = DateTime.now();
+                            if (device.product.isEmpty ||
+                                device.product == 'Reachable network device') {
+                              device.product = guessProduct(
+                                fresh.ports,
+                                hostname: fresh.hostname,
+                                mac: fresh.mac,
+                              );
+                            }
                             await changed();
                           },
                     onApplyHostname:
@@ -3249,6 +3276,53 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
 
 enum DeviceStatus { saved, active, changed, missing, dead }
 
+String macDiscoveryExplanation() {
+  if (Platform.isAndroid) {
+    return 'Android 10 and newer blocks regular apps from reading the LAN '
+        'neighbor table. Any MAC the phone exposes will appear here; add the '
+        'rest with Edit or import them from your router or scan notes.';
+  }
+  if (Platform.isIOS) {
+    return 'iOS does not expose other LAN devices’ MAC addresses to regular '
+        'apps. Add them with Edit or import them from your router or scan notes.';
+  }
+  return 'The neighbor table did not report every MAC. Devices behind another '
+      'router/VLAN, client isolation, or an incomplete local cache may remain '
+      'unavailable.';
+}
+
+class MacDiscoveryNotice extends StatelessWidget {
+  const MacDiscoveryNotice({super.key, required this.unresolvedCount});
+
+  final int unresolvedCount;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: double.infinity,
+    margin: const EdgeInsets.only(top: 10),
+    padding: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: warning.withValues(alpha: .08),
+      border: Border.all(color: warning.withValues(alpha: .55)),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.info_outline_rounded, color: warning, size: 20),
+        const SizedBox(width: 9),
+        Expanded(
+          child: Text(
+            '$unresolvedCount ${unresolvedCount == 1 ? 'device has' : 'devices have'} '
+            'no discovered MAC. ${macDiscoveryExplanation()}',
+            style: const TextStyle(color: secondary, fontSize: 12),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
 class _SwipeStatusBackground extends StatelessWidget {
   const _SwipeStatusBackground({
     required this.alignment,
@@ -3292,6 +3366,7 @@ class DeviceTile extends StatelessWidget {
     required this.status,
     required this.onTap,
     required this.onTools,
+    this.observedMac = '',
     this.onPing,
     this.onKeep,
     this.onDelete,
@@ -3301,12 +3376,18 @@ class DeviceTile extends StatelessWidget {
   final DeviceStatus status;
   final VoidCallback onTap;
   final VoidCallback onTools;
+  final String observedMac;
   final VoidCallback? onPing;
   final VoidCallback? onKeep;
   final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
+    final visibleMac = isUsableMacAddress(device.mac)
+        ? normalizeMacAddress(device.mac)
+        : isUsableMacAddress(observedMac)
+        ? normalizeMacAddress(observedMac)
+        : '';
     final color = switch (status) {
       DeviceStatus.active => border,
       DeviceStatus.changed => warning,
@@ -3365,6 +3446,17 @@ class DeviceTile extends StatelessWidget {
                   if (device.ports.isNotEmpty)
                     Text(
                       device.ports.join(', '),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: secondary,
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  if (visibleMac.isNotEmpty)
+                    Text(
+                      '$visibleMac${device.mac.isEmpty ? ' · detected' : ''}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
@@ -4347,6 +4439,29 @@ class ScannedHost {
   );
 }
 
+ScannedHost mergePortScanObservation(
+  ScannedHost ports, {
+  ScannedHost? previous,
+  DeviceRecord? saved,
+}) {
+  final previousHostname = previous?.hostname ?? '';
+  final hostname = ports.hostname.isNotEmpty && ports.hostname != ports.ip
+      ? ports.hostname
+      : previousHostname.isNotEmpty && previousHostname != ports.ip
+      ? previousHostname
+      : saved?.name.isNotEmpty == true
+      ? saved!.name
+      : ports.ip;
+  final mac = isUsableMacAddress(ports.mac)
+      ? normalizeMacAddress(ports.mac)
+      : isUsableMacAddress(previous?.mac ?? '')
+      ? normalizeMacAddress(previous!.mac)
+      : isUsableMacAddress(saved?.mac ?? '')
+      ? normalizeMacAddress(saved!.mac)
+      : '';
+  return ScannedHost(ports.ip, hostname, List.of(ports.ports), mac: mac);
+}
+
 const discoveryPorts = [
   22,
   53,
@@ -4414,14 +4529,23 @@ Future<List<ScannedHost>> discoverLan({
     );
   }
   final macs = await discoverNeighborMacs();
+  final foundByIp = {for (final host in found) host.ip: host};
+  for (final entry in macs.entries) {
+    if (entry.key.startsWith('$prefix.')) {
+      foundByIp.putIfAbsent(
+        entry.key,
+        () => ScannedHost(entry.key, entry.key, const [], mac: entry.value),
+      );
+    }
+  }
   final resolved =
-      found
+      foundByIp.values
           .map(
             (host) => ScannedHost(
               host.ip,
               host.hostname,
               host.ports,
-              mac: macs[host.ip] ?? '',
+              mac: macs[host.ip] ?? host.mac,
             ),
           )
           .toList()
@@ -4435,25 +4559,80 @@ Future<Map<String, String>> discoverNeighborMacs() async {
     final arpFile = File('/proc/net/arp');
     if (await arpFile.exists()) output.writeln(await arpFile.readAsString());
   } catch (_) {}
+  final commands = <(String, List<String>)>[];
+  if (Platform.isAndroid) {
+    commands.add(('/system/bin/ip', const ['neighbor', 'show']));
+  } else if (Platform.isLinux) {
+    commands
+      ..add((
+        _firstAvailableExecutable(const ['/usr/sbin/ip', '/sbin/ip'], 'ip'),
+        const ['neighbor', 'show'],
+      ))
+      ..add((
+        _firstAvailableExecutable(const ['/usr/sbin/arp'], 'arp'),
+        const ['-an'],
+      ));
+  } else if (Platform.isMacOS) {
+    commands.add((
+      _firstAvailableExecutable(const ['/usr/sbin/arp'], 'arp'),
+      const ['-an'],
+    ));
+  } else if (Platform.isWindows) {
+    commands.add(('arp', const ['-a']));
+  }
+  final commandOutputs = await Future.wait(
+    commands.map((command) => _neighborCommandOutput(command.$1, command.$2)),
+  );
+  for (final commandOutput in commandOutputs) {
+    if (commandOutput.isNotEmpty) output.writeln(commandOutput);
+  }
+  return parseNeighborMacs(output.toString());
+}
+
+String _firstAvailableExecutable(List<String> paths, String fallback) =>
+    paths.firstWhere((path) => File(path).existsSync(), orElse: () => fallback);
+
+Future<String> _neighborCommandOutput(
+  String executable,
+  List<String> arguments,
+) async {
   try {
     final result = await Process.run(
-      Platform.isWindows ? 'arp' : 'arp',
-      Platform.isWindows ? ['-a'] : ['-an'],
+      executable,
+      arguments,
     ).timeout(const Duration(seconds: 2));
-    output.writeln(result.stdout);
-  } catch (_) {}
+    return '${result.stdout}';
+  } catch (_) {
+    return '';
+  }
+}
 
+Map<String, String> parseNeighborMacs(String output) {
   final addresses = <String, String>{};
   final ipPattern = RegExp(r'\b(?:\d{1,3}\.){3}\d{1,3}\b');
   final macPattern = RegExp(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b');
-  for (final line in output.toString().split('\n')) {
+  for (final line in output.split('\n')) {
     final ip = ipPattern.firstMatch(line)?.group(0);
     final mac = macPattern.firstMatch(line)?.group(0);
-    if (ip != null && mac != null && mac != '00:00:00:00:00:00') {
-      addresses[ip] = mac.replaceAll('-', ':').toUpperCase();
+    if (ip != null &&
+        InternetAddress.tryParse(ip)?.type == InternetAddressType.IPv4 &&
+        mac != null &&
+        isUsableMacAddress(mac)) {
+      addresses[ip] = normalizeMacAddress(mac);
     }
   }
   return addresses;
+}
+
+String normalizeMacAddress(String value) =>
+    value.trim().replaceAll('-', ':').toUpperCase();
+
+bool isUsableMacAddress(String value) {
+  final normalized = normalizeMacAddress(value);
+  if (!RegExp(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$').hasMatch(normalized)) {
+    return false;
+  }
+  return normalized != '00:00:00:00:00:00' && normalized != 'FF:FF:FF:FF:FF:FF';
 }
 
 Future<bool> pingHost(String ip) async {
@@ -4826,6 +5005,53 @@ class _NetworkEditorDialogState extends State<_NetworkEditorDialog> {
   );
 }
 
+class _DeviceNameDialog extends StatefulWidget {
+  const _DeviceNameDialog({required this.initialName});
+
+  final String initialName;
+
+  @override
+  State<_DeviceNameDialog> createState() => _DeviceNameDialogState();
+}
+
+class _DeviceNameDialogState extends State<_DeviceNameDialog> {
+  late final controller = TextEditingController(text: widget.initialName);
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  void save() {
+    final name = controller.text.trim();
+    if (name.isEmpty) return;
+    FocusScope.of(context).unfocus();
+    Navigator.pop(context, name);
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Name this device'),
+    content: TextField(
+      controller: controller,
+      autofocus: true,
+      decoration: const InputDecoration(
+        labelText: 'Device name',
+        hintText: 'Office printer',
+      ),
+      onSubmitted: (_) => save(),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('CANCEL'),
+      ),
+      FilledButton(onPressed: save, child: const Text('SAVE')),
+    ],
+  );
+}
+
 Future<DeviceRecord?> deviceEditor(
   BuildContext context,
   DeviceRecord? existing,
@@ -4928,6 +5154,7 @@ Future<void> showDevice(
   VoidCallback? onDelete,
   VoidCallback? onAddNewPorts,
   VoidCallback? onApplyPorts,
+  VoidCallback? onApplyMac,
   VoidCallback? onApplyHostname,
 }) async {
   final savedPorts = device.ports.toSet();
@@ -4985,6 +5212,41 @@ Future<void> showDevice(
               label: 'MAC ADDRESS',
               value: device.mac.isEmpty ? 'Not documented' : device.mac,
             ),
+            if (onApplyMac != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: warning.withValues(alpha: .08),
+                  border: Border.all(color: warning),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  'DISCOVERED MAC\n${normalizeMacAddress(fresh!.mac)}',
+                  style: const TextStyle(
+                    color: warning,
+                    fontWeight: FontWeight.w800,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context, _DeviceSheetAction.applyMac);
+                  },
+                  icon: const Icon(Icons.fingerprint_rounded),
+                  label: Text(
+                    device.mac.isEmpty
+                        ? 'SAVE DISCOVERED MAC'
+                        : 'REPLACE SAVED MAC',
+                  ),
+                ),
+              ),
+            ],
             DetailRow(
               label: 'PRODUCT',
               value: device.product.isEmpty ? 'Unidentified' : device.product,
@@ -5170,6 +5432,8 @@ Future<void> showDevice(
       onAddNewPorts?.call();
     case _DeviceSheetAction.applyPorts:
       onApplyPorts?.call();
+    case _DeviceSheetAction.applyMac:
+      onApplyMac?.call();
     case _DeviceSheetAction.applyHostname:
       onApplyHostname?.call();
     case null:
@@ -5184,6 +5448,7 @@ enum _DeviceSheetAction {
   ping,
   addNewPorts,
   applyPorts,
+  applyMac,
   applyHostname,
 }
 
