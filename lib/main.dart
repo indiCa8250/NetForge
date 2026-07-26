@@ -5,9 +5,12 @@ import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() => runApp(const LanMapperApp());
@@ -179,10 +182,77 @@ class NetworkMap {
   };
 }
 
+void mergeDevicesInto(
+  NetworkMap target,
+  Iterable<DeviceRecord> incomingDevices,
+) {
+  for (final incoming in incomingDevices) {
+    final normalizedMac = incoming.mac.trim().toUpperCase();
+    final index = target.devices.indexWhere((existing) {
+      final existingMac = existing.mac.trim().toUpperCase();
+      if (normalizedMac.isNotEmpty) return existingMac == normalizedMac;
+      return existing.ip == incoming.ip;
+    });
+    if (index < 0) {
+      target.devices.add(DeviceRecord.fromJson(incoming.toJson()));
+      continue;
+    }
+    final existing = target.devices[index];
+    final mergedPorts = {...existing.ports, ...incoming.ports}.toList()..sort();
+    existing.ports = mergedPorts;
+    if (existing.name.isEmpty) existing.name = incoming.name;
+    if (existing.mac.isEmpty) existing.mac = incoming.mac;
+    if (existing.product.isEmpty ||
+        existing.product == 'Reachable network device') {
+      existing.product = incoming.product;
+    }
+    if (incoming.notes.isNotEmpty && !existing.notes.contains(incoming.notes)) {
+      existing.notes = existing.notes.isEmpty
+          ? incoming.notes
+          : '${existing.notes}\n${incoming.notes}';
+    }
+    if (incoming.lastSeen.isAfter(existing.lastSeen)) {
+      existing.lastSeen = incoming.lastSeen;
+    }
+    existing.isDead = existing.isDead && incoming.isDead;
+  }
+}
+
+NetworkMap mergeNetworks(NetworkMap first, NetworkMap second) {
+  final merged = NetworkMap(
+    id: DateTime.now().microsecondsSinceEpoch.toString(),
+    name: '${first.name} + ${second.name}',
+    ssid: first.ssid == second.ssid ? first.ssid : '',
+    gateway: first.gateway == second.gateway ? first.gateway : '',
+    subnet: first.subnet == second.subnet ? first.subnet : '',
+    notes: [
+      'Merged from “${first.name}” and “${second.name}”.',
+      if (first.notes.isNotEmpty) first.notes,
+      if (second.notes.isNotEmpty && second.notes != first.notes) second.notes,
+    ].join('\n'),
+    devices: first.devices
+        .map((device) => DeviceRecord.fromJson(device.toJson()))
+        .toList(),
+    removedDevices: first.removedDevices
+        .map((device) => DeviceRecord.fromJson(device.toJson()))
+        .toList(),
+  );
+  mergeDevicesInto(merged, second.devices);
+  final removedMap = NetworkMap(
+    id: 'removed',
+    name: 'removed',
+    devices: merged.removedDevices,
+  );
+  mergeDevicesInto(removedMap, second.removedDevices);
+  merged.removedDevices = removedMap.devices;
+  return merged;
+}
+
 class LiveDevice {
   LiveDevice({
     required this.ip,
     this.hostname = '',
+    this.mac = '',
     List<int>? ports,
     DateTime? lastSeen,
   }) : ports = ports ?? [],
@@ -190,6 +260,7 @@ class LiveDevice {
 
   final String ip;
   String hostname;
+  String mac;
   List<int> ports;
   DateTime lastSeen;
 }
@@ -213,6 +284,7 @@ class LiveInventory extends ChangeNotifier {
     if (host.hostname.isNotEmpty && host.hostname != host.ip) {
       current.hostname = host.hostname;
     }
+    if (host.mac.isNotEmpty) current.mac = host.mac;
     final merged = {...current.ports, ...host.ports}.toList()..sort();
     current
       ..ports = merged
@@ -229,6 +301,7 @@ class LiveInventory extends ChangeNotifier {
       if (host.hostname.isNotEmpty && host.hostname != host.ip) {
         current.hostname = host.hostname;
       }
+      if (host.mac.isNotEmpty) current.mac = host.mac;
       final merged = {...current.ports, ...host.ports}.toList()..sort();
       current
         ..ports = merged
@@ -246,11 +319,33 @@ class LiveInventory extends ChangeNotifier {
     notifyListeners();
   }
 
+  void replacePorts(String ip, Iterable<int> ports) {
+    final current = _devices.putIfAbsent(ip, () => LiveDevice(ip: ip));
+    final sortedPorts = ports.toSet().toList()..sort();
+    current
+      ..ports = sortedPorts
+      ..lastSeen = DateTime.now();
+    notifyListeners();
+  }
+
   void observeHostname(String ip, String hostname) {
     final current = _devices.putIfAbsent(ip, () => LiveDevice(ip: ip));
     current
       ..hostname = hostname
       ..lastSeen = DateTime.now();
+    notifyListeners();
+  }
+
+  void observeMac(String ip, String mac) {
+    final current = _devices.putIfAbsent(ip, () => LiveDevice(ip: ip));
+    current
+      ..mac = mac
+      ..lastSeen = DateTime.now();
+    notifyListeners();
+  }
+
+  void clear() {
+    _devices.clear();
     notifyListeners();
   }
 }
@@ -264,10 +359,13 @@ class MapperShell extends StatefulWidget {
 
 class _MapperShellState extends State<MapperShell> {
   static const statusChannel = MethodChannel('netforge/device_status');
+  static const secretSequence = [0, 2, 2, 1, 1, 1];
   final networks = <NetworkMap>[];
   final liveInventory = LiveInventory();
   Map<String, dynamic> connection = {};
   int tab = 0;
+  int secretProgress = 0;
+  bool secretOpen = false;
   bool loaded = false;
   bool loadingConnection = false;
 
@@ -402,7 +500,10 @@ class _MapperShellState extends State<MapperShell> {
   }
 
   Future<void> createNetwork() async {
-    final result = await _editNetworkDialog(context);
+    final result = await _editNetworkDialog(
+      context,
+      initialSsid: connection['ssid'] as String? ?? '',
+    );
     if (result == null) return;
     final network = NetworkMap(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
@@ -417,12 +518,40 @@ class _MapperShellState extends State<MapperShell> {
     if (mounted) await openNetwork(network);
   }
 
+  void selectMainDestination(int value) {
+    if (value == secretSequence[secretProgress]) {
+      secretProgress++;
+      if (secretProgress == secretSequence.length) {
+        setState(() {
+          secretProgress = 0;
+          secretOpen = true;
+          tab = 0;
+        });
+        return;
+      }
+    } else {
+      secretProgress = value == secretSequence.first ? 1 : 0;
+    }
+    setState(() => tab = value);
+  }
+
+  void closeSecretNotes() {
+    setState(() {
+      secretOpen = false;
+      secretProgress = 0;
+      tab = 0;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!loaded) {
       return const Scaffold(
         body: Center(child: CircularProgressIndicator(color: accent)),
       );
+    }
+    if (secretOpen) {
+      return SecretNotesPage(onClose: closeSecretNotes);
     }
     final pages = [
       HomePage(
@@ -441,10 +570,12 @@ class _MapperShellState extends State<MapperShell> {
         liveInventory: liveInventory,
         onCreateNetwork: createNetwork,
         onScanSubnet: () => setState(() => tab = 2),
+        onReviewPortResults: () => setState(() => tab = 2),
       ),
       NetworksPage(
         networks: networks,
         liveInventory: liveInventory,
+        currentSsid: connection['ssid'] as String? ?? '',
         onOpen: openNetwork,
         onCreate: createNetwork,
         onChanged: save,
@@ -454,7 +585,7 @@ class _MapperShellState extends State<MapperShell> {
       body: IndexedStack(index: tab, children: pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: tab,
-        onDestinationSelected: (value) => setState(() => tab = value),
+        onDestinationSelected: selectMainDestination,
         destinations: const [
           NavigationDestination(icon: Icon(Icons.home_rounded), label: 'Home'),
           NavigationDestination(
@@ -469,6 +600,803 @@ class _MapperShellState extends State<MapperShell> {
       ),
     );
   }
+}
+
+class SecretNote {
+  SecretNote({
+    required this.id,
+    required this.title,
+    required this.body,
+    this.kind = 'text',
+    this.parentId,
+    this.imagePath = '',
+    List<String>? attachments,
+    DateTime? updatedAt,
+  }) : attachments = attachments ?? [],
+       updatedAt = updatedAt ?? DateTime.now();
+
+  final String id;
+  String title;
+  String body;
+  String kind;
+  String? parentId;
+  String imagePath;
+  List<String> attachments;
+  DateTime updatedAt;
+
+  factory SecretNote.fromJson(Map<String, dynamic> json) => SecretNote(
+    id: json['id'] as String,
+    title: json['title'] as String? ?? '',
+    body: json['body'] as String? ?? '',
+    kind: json['kind'] as String? ?? 'text',
+    parentId: json['parentId'] as String?,
+    imagePath: json['imagePath'] as String? ?? '',
+    attachments: (json['attachments'] as List<dynamic>? ?? const [])
+        .cast<String>(),
+    updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? ''),
+  );
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'body': body,
+    'kind': kind,
+    'parentId': parentId,
+    'imagePath': imagePath,
+    'attachments': attachments,
+    'updatedAt': updatedAt.toIso8601String(),
+  };
+}
+
+class SecretNotesPage extends StatefulWidget {
+  const SecretNotesPage({super.key, required this.onClose});
+
+  final VoidCallback onClose;
+
+  @override
+  State<SecretNotesPage> createState() => _SecretNotesPageState();
+}
+
+class _SecretNotesPageState extends State<SecretNotesPage> {
+  static const storageKey = 'netforge.secret_notes';
+  final notes = <SecretNote>[];
+  bool loaded = false;
+  String? currentFolderId;
+  String? copiedEntryId;
+  final selectedEntryIds = <String>{};
+
+  List<SecretNote> get visibleEntries =>
+      notes.where((entry) => entry.parentId == currentFolderId).toList()
+        ..sort((a, b) {
+          if (a.kind == 'folder' && b.kind != 'folder') return -1;
+          if (a.kind != 'folder' && b.kind == 'folder') return 1;
+          return b.updatedAt.compareTo(a.updatedAt);
+        });
+
+  SecretNote? get currentFolder => currentFolderId == null
+      ? null
+      : notes.where((entry) => entry.id == currentFolderId).firstOrNull;
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    final preferences = await SharedPreferences.getInstance();
+    try {
+      final values =
+          jsonDecode(preferences.getString(storageKey) ?? '[]')
+              as List<dynamic>;
+      notes.addAll(
+        values.map(
+          (value) => SecretNote.fromJson(value as Map<String, dynamic>),
+        ),
+      );
+      notes.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    } catch (_) {
+      // Damaged private notes must not prevent the area from opening.
+    }
+    if (mounted) setState(() => loaded = true);
+  }
+
+  Future<void> save() async {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setString(
+      storageKey,
+      jsonEncode(notes.map((note) => note.toJson()).toList()),
+    );
+  }
+
+  Future<void> editNote([SecretNote? existing]) async {
+    final result = await showDialog<_SecretNoteDraft>(
+      context: context,
+      builder: (context) => _SecretNoteEditor(existing: existing),
+    );
+    if (result == null) return;
+    setState(() {
+      if (existing == null) {
+        notes.insert(
+          0,
+          SecretNote(
+            id: DateTime.now().microsecondsSinceEpoch.toString(),
+            title: result.title,
+            body: result.body,
+            parentId: currentFolderId,
+          ),
+        );
+      } else {
+        existing
+          ..title = result.title
+          ..body = result.body
+          ..updatedAt = DateTime.now();
+        notes.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      }
+    });
+    await save();
+  }
+
+  Future<Directory> mediaDirectory() async {
+    final documents = await getApplicationDocumentsDirectory();
+    final directory = Directory('${documents.path}/netforge_private_media');
+    if (!await directory.exists()) await directory.create(recursive: true);
+    return directory;
+  }
+
+  Future<String> copyImageIntoWorkspace(XFile source) async {
+    final directory = await mediaDirectory();
+    final extension = source.name.contains('.')
+        ? '.${source.name.split('.').last.toLowerCase()}'
+        : '.jpg';
+    final destination =
+        '${directory.path}/${DateTime.now().microsecondsSinceEpoch}$extension';
+    await File(source.path).copy(destination);
+    return destination;
+  }
+
+  Future<void> importImages() async {
+    final picked = await openFiles(
+      acceptedTypeGroups: const [
+        XTypeGroup(
+          label: 'Images',
+          extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'],
+          mimeTypes: ['image/*'],
+        ),
+      ],
+    );
+    if (picked.isEmpty) return;
+    final imported = <SecretNote>[];
+    for (final image in picked) {
+      final path = await copyImageIntoWorkspace(image);
+      imported.add(
+        SecretNote(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          title: image.name,
+          body: '',
+          kind: 'image',
+          parentId: currentFolderId,
+          imagePath: path,
+        ),
+      );
+    }
+    if (!mounted) return;
+    setState(() => notes.addAll(imported));
+    await save();
+  }
+
+  Future<void> showCreateMenu() async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: surface,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.note_add_outlined),
+              title: const Text('New note'),
+              onTap: () => Navigator.pop(context, 'note'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.create_new_folder_outlined),
+              title: const Text('New folder'),
+              onTap: () => Navigator.pop(context, 'folder'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.add_photo_alternate_outlined),
+              title: const Text('Add images'),
+              onTap: () => Navigator.pop(context, 'images'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    switch (action) {
+      case 'note':
+        await editNote();
+      case 'folder':
+        await createFolder();
+      case 'images':
+        await importImages();
+      case null:
+        break;
+    }
+  }
+
+  Future<void> createFolder() async {
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('New folder'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Folder name *'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCEL'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (controller.text.trim().isNotEmpty) {
+                Navigator.pop(context, controller.text.trim());
+              }
+            },
+            child: const Text('CREATE'),
+          ),
+        ],
+      ),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    controller.dispose();
+    if (name == null || !mounted) return;
+    setState(
+      () => notes.add(
+        SecretNote(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          title: name,
+          body: '',
+          kind: 'folder',
+          parentId: currentFolderId,
+        ),
+      ),
+    );
+    await save();
+  }
+
+  Future<void> attachImages(SecretNote note) async {
+    final picked = await openFiles(
+      acceptedTypeGroups: const [
+        XTypeGroup(
+          label: 'Images',
+          extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'],
+          mimeTypes: ['image/*'],
+        ),
+      ],
+    );
+    if (picked.isEmpty) return;
+    for (final image in picked) {
+      note.attachments.add(await copyImageIntoWorkspace(image));
+    }
+    note.updatedAt = DateTime.now();
+    if (mounted) setState(() {});
+    await save();
+  }
+
+  Future<void> pasteEntry() async {
+    final source = notes.where((item) => item.id == copiedEntryId).firstOrNull;
+    if (source == null) return;
+    var imagePath = source.imagePath;
+    if (imagePath.isNotEmpty && await File(imagePath).exists()) {
+      imagePath = await copyImageIntoWorkspace(XFile(imagePath));
+    }
+    final attachments = <String>[];
+    for (final path in source.attachments) {
+      if (await File(path).exists()) {
+        attachments.add(await copyImageIntoWorkspace(XFile(path)));
+      }
+    }
+    if (!mounted) return;
+    setState(
+      () => notes.add(
+        SecretNote(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          title: '${source.title} copy',
+          body: source.body,
+          kind: source.kind,
+          parentId: currentFolderId,
+          imagePath: imagePath,
+          attachments: attachments,
+        ),
+      ),
+    );
+    await save();
+  }
+
+  Future<void> cropImage(SecretNote entry) async {
+    final decoded = img.decodeImage(await File(entry.imagePath).readAsBytes());
+    if (decoded == null) return;
+    final size = decoded.width < decoded.height
+        ? decoded.width
+        : decoded.height;
+    final cropped = img.copyCrop(
+      decoded,
+      x: (decoded.width - size) ~/ 2,
+      y: (decoded.height - size) ~/ 2,
+      width: size,
+      height: size,
+    );
+    await File(
+      entry.imagePath,
+    ).writeAsBytes(img.encodeJpg(cropped, quality: 92));
+    entry.updatedAt = DateTime.now();
+    if (mounted) setState(() {});
+    await save();
+  }
+
+  Future<void> shareEntry(SecretNote entry) async {
+    if (entry.kind == 'image') {
+      await SharePlus.instance.share(
+        ShareParams(files: [XFile(entry.imagePath)], title: entry.title),
+      );
+    } else {
+      await SharePlus.instance.share(
+        ShareParams(text: '${entry.title}\n\n${entry.body}'),
+      );
+    }
+  }
+
+  Future<void> openEntry(SecretNote entry) async {
+    if (entry.kind == 'folder') {
+      setState(() => currentFolderId = entry.id);
+      return;
+    }
+    final action = await showDialog<String>(
+      context: context,
+      builder: (context) => Dialog(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 700, maxHeight: 760),
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        entry.title,
+                        style: const TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: entry.kind == 'text'
+                          ? () => Navigator.pop(context, 'edit')
+                          : null,
+                      tooltip: 'Edit note',
+                      icon: const Icon(Icons.edit_outlined),
+                    ),
+                    IconButton(
+                      onPressed: () => Navigator.pop(context),
+                      tooltip: 'Close viewer',
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Flexible(
+                  child: SingleChildScrollView(
+                    child: entry.kind == 'image'
+                        ? Image.file(File(entry.imagePath))
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              SelectableText(
+                                entry.body.isEmpty ? 'Empty note' : entry.body,
+                              ),
+                              if (entry.attachments.isNotEmpty) ...[
+                                const SizedBox(height: 16),
+                                const Text(
+                                  'ATTACHMENTS',
+                                  style: TextStyle(
+                                    color: secondary,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: entry.attachments
+                                      .map(
+                                        (path) => ClipRRect(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          child: Image.file(
+                                            File(path),
+                                            width: 130,
+                                            height: 100,
+                                            fit: BoxFit.cover,
+                                          ),
+                                        ),
+                                      )
+                                      .toList(),
+                                ),
+                              ],
+                            ],
+                          ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    if (action == 'edit' && mounted) await editNote(entry);
+  }
+
+  Future<void> handleEntryAction(String action, SecretNote entry) async {
+    switch (action) {
+      case 'edit':
+        await editNote(entry);
+      case 'attach':
+        await attachImages(entry);
+      case 'copy':
+        setState(() => copiedEntryId = entry.id);
+      case 'crop':
+        await cropImage(entry);
+      case 'share':
+        await shareEntry(entry);
+      case 'delete':
+        await deleteNote(entry);
+    }
+  }
+
+  Future<void> deleteNote(SecretNote note) async {
+    await deleteEntries({note});
+  }
+
+  Future<void> deleteSelectedEntries() async {
+    final selected = notes
+        .where((entry) => selectedEntryIds.contains(entry.id))
+        .toSet();
+    await deleteEntries(selected);
+  }
+
+  Future<void> deleteEntries(Set<SecretNote> requested) async {
+    if (requested.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(requested.length == 1 ? 'Delete item?' : 'Delete items?'),
+        content: Text(
+          requested.length == 1
+              ? 'Delete “${requested.single.title}”?'
+              : 'Delete ${requested.length} selected items? Folders and their contents will be removed.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('CANCEL'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: danger),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('DELETE'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final removing = <SecretNote>{...requested};
+    var foundChild = true;
+    while (foundChild) {
+      foundChild = false;
+      for (final entry in notes) {
+        if (!removing.contains(entry) &&
+            removing.any((parent) => entry.parentId == parent.id)) {
+          removing.add(entry);
+          foundChild = true;
+        }
+      }
+    }
+    for (final entry in removing) {
+      for (final path in [entry.imagePath, ...entry.attachments]) {
+        if (path.isEmpty) continue;
+        try {
+          final file = File(path);
+          if (await file.exists()) await file.delete();
+        } catch (_) {}
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      notes.removeWhere(removing.contains);
+      selectedEntryIds.clear();
+    });
+    await save();
+  }
+
+  void handleBack() {
+    if (selectedEntryIds.isNotEmpty) {
+      setState(selectedEntryIds.clear);
+    } else if (currentFolderId != null) {
+      setState(() => currentFolderId = currentFolder?.parentId);
+    } else {
+      widget.onClose();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope(
+    canPop: false,
+    onPopInvokedWithResult: (didPop, result) {
+      if (!didPop) handleBack();
+    },
+    child: Scaffold(
+      appBar: AppBar(
+        automaticallyImplyLeading: false,
+        leading: selectedEntryIds.isNotEmpty
+            ? IconButton(
+                onPressed: () => setState(selectedEntryIds.clear),
+                tooltip: 'Cancel selection',
+                icon: const Icon(Icons.close_rounded),
+              )
+            : currentFolderId == null
+            ? null
+            : IconButton(
+                onPressed: () =>
+                    setState(() => currentFolderId = currentFolder?.parentId),
+                tooltip: 'Up one folder',
+                icon: const Icon(Icons.arrow_back_rounded),
+              ),
+        title: Text(
+          selectedEntryIds.isEmpty
+              ? currentFolder?.title ?? 'Private files'
+              : '${selectedEntryIds.length} selected',
+        ),
+        actions: [
+          if (selectedEntryIds.isNotEmpty)
+            IconButton(
+              onPressed: deleteSelectedEntries,
+              tooltip: 'Delete selected',
+              color: danger,
+              icon: const Icon(Icons.delete_outline_rounded),
+            )
+          else if (copiedEntryId != null)
+            IconButton(
+              onPressed: pasteEntry,
+              tooltip: 'Paste copied item',
+              icon: const Icon(Icons.content_paste_rounded),
+            ),
+          if (selectedEntryIds.isEmpty)
+            IconButton(
+              onPressed: widget.onClose,
+              tooltip: 'Close notes',
+              icon: const Icon(Icons.close_rounded),
+            ),
+        ],
+      ),
+      body: !loaded
+          ? const Center(child: CircularProgressIndicator(color: accent))
+          : GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onLongPress: selectedEntryIds.isEmpty ? showCreateMenu : null,
+              child: visibleEntries.isEmpty
+                  ? const EmptyMessage(
+                      icon: Icons.folder_open_rounded,
+                      text: 'This folder is empty. Hold here to add something.',
+                    )
+                  : GridView.builder(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                      gridDelegate:
+                          const SliverGridDelegateWithMaxCrossAxisExtent(
+                            maxCrossAxisExtent: 260,
+                            mainAxisExtent: 210,
+                            crossAxisSpacing: 10,
+                            mainAxisSpacing: 10,
+                          ),
+                      itemCount: visibleEntries.length,
+                      itemBuilder: (context, index) {
+                        final entry = visibleEntries[index];
+                        final selected = selectedEntryIds.contains(entry.id);
+                        return Card(
+                          color: surface,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            side: BorderSide(
+                              color: selected ? danger : border,
+                              width: selected ? 3 : 1,
+                            ),
+                          ),
+                          clipBehavior: Clip.antiAlias,
+                          child: InkWell(
+                            onTap: () {
+                              if (selectedEntryIds.isEmpty) {
+                                openEntry(entry);
+                              } else {
+                                setState(() {
+                                  if (!selectedEntryIds.add(entry.id)) {
+                                    selectedEntryIds.remove(entry.id);
+                                  }
+                                });
+                              }
+                            },
+                            onLongPress: () =>
+                                setState(() => selectedEntryIds.add(entry.id)),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  child:
+                                      entry.kind == 'image' &&
+                                          entry.imagePath.isNotEmpty
+                                      ? Image.file(
+                                          File(entry.imagePath),
+                                          width: double.infinity,
+                                          fit: BoxFit.cover,
+                                        )
+                                      : Center(
+                                          child: Icon(
+                                            entry.kind == 'folder'
+                                                ? Icons.folder_rounded
+                                                : Icons.description_outlined,
+                                            color: entry.kind == 'folder'
+                                                ? warning
+                                                : accent,
+                                            size: 64,
+                                          ),
+                                        ),
+                                ),
+                                ListTile(
+                                  dense: true,
+                                  title: Text(
+                                    entry.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  subtitle: Text(
+                                    entry.kind == 'folder'
+                                        ? 'Folder'
+                                        : entry.kind == 'image'
+                                        ? 'Image'
+                                        : '${entry.attachments.length} attachments',
+                                  ),
+                                  trailing: selectedEntryIds.isNotEmpty
+                                      ? Icon(
+                                          selected
+                                              ? Icons.check_circle_rounded
+                                              : Icons.circle_outlined,
+                                          color: selected ? danger : secondary,
+                                        )
+                                      : PopupMenuButton<String>(
+                                          onSelected: (action) =>
+                                              handleEntryAction(action, entry),
+                                          itemBuilder: (context) => [
+                                            if (entry.kind == 'text')
+                                              const PopupMenuItem(
+                                                value: 'edit',
+                                                child: Text('Edit note'),
+                                              ),
+                                            if (entry.kind == 'text')
+                                              const PopupMenuItem(
+                                                value: 'attach',
+                                                child: Text('Attach images'),
+                                              ),
+                                            const PopupMenuItem(
+                                              value: 'copy',
+                                              child: Text('Copy'),
+                                            ),
+                                            if (entry.kind == 'image')
+                                              const PopupMenuItem(
+                                                value: 'crop',
+                                                child: Text('Crop square'),
+                                              ),
+                                            if (entry.kind != 'folder')
+                                              const PopupMenuItem(
+                                                value: 'share',
+                                                child: Text('Share / send'),
+                                              ),
+                                            const PopupMenuItem(
+                                              value: 'delete',
+                                              child: Text('Delete'),
+                                            ),
+                                          ],
+                                        ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+    ),
+  );
+}
+
+class _SecretNoteDraft {
+  const _SecretNoteDraft(this.title, this.body);
+  final String title;
+  final String body;
+}
+
+class _SecretNoteEditor extends StatefulWidget {
+  const _SecretNoteEditor({this.existing});
+  final SecretNote? existing;
+
+  @override
+  State<_SecretNoteEditor> createState() => _SecretNoteEditorState();
+}
+
+class _SecretNoteEditorState extends State<_SecretNoteEditor> {
+  late final title = TextEditingController(text: widget.existing?.title ?? '');
+  late final body = TextEditingController(text: widget.existing?.body ?? '');
+
+  @override
+  void dispose() {
+    title.dispose();
+    body.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.existing == null ? 'New note' : 'Edit note'),
+    content: SizedBox(
+      width: 520,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: title,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Title *'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: body,
+            minLines: 8,
+            maxLines: 16,
+            decoration: const InputDecoration(
+              labelText: 'Note',
+              alignLabelWithHint: true,
+            ),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('CANCEL'),
+      ),
+      FilledButton(
+        onPressed: () {
+          if (title.text.trim().isEmpty) return;
+          Navigator.pop(
+            context,
+            _SecretNoteDraft(title.text.trim(), body.text.trim()),
+          );
+        },
+        child: const Text('SAVE'),
+      ),
+    ],
+  );
 }
 
 class HomePage extends StatelessWidget {
@@ -580,6 +1508,7 @@ class HomePage extends StatelessWidget {
                   label: 'NETWORKS',
                   value: '${networks.length}',
                   icon: Icons.hub_rounded,
+                  onTap: onGoToNetworks,
                 ),
               ),
               const SizedBox(width: 10),
@@ -626,6 +1555,7 @@ class NetworksPage extends StatelessWidget {
     super.key,
     required this.networks,
     required this.liveInventory,
+    required this.currentSsid,
     required this.onOpen,
     required this.onCreate,
     required this.onChanged,
@@ -633,9 +1563,82 @@ class NetworksPage extends StatelessWidget {
 
   final List<NetworkMap> networks;
   final LiveInventory liveInventory;
+  final String currentSsid;
   final ValueChanged<NetworkMap> onOpen;
   final VoidCallback onCreate;
   final Future<void> Function() onChanged;
+
+  Future<void> mergeSavedNetworks(BuildContext context) async {
+    if (networks.length < 2) return;
+    var firstId = networks[0].id;
+    var secondId = networks[1].id;
+    final selection = await showDialog<List<String>>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Merge saved networks'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              DropdownButtonFormField<String>(
+                initialValue: firstId,
+                decoration: const InputDecoration(labelText: 'First network'),
+                items: networks
+                    .map(
+                      (network) => DropdownMenuItem(
+                        value: network.id,
+                        child: Text(network.name),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) =>
+                    setDialogState(() => firstId = value ?? firstId),
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                initialValue: secondId,
+                decoration: const InputDecoration(labelText: 'Second network'),
+                items: networks
+                    .map(
+                      (network) => DropdownMenuItem(
+                        value: network.id,
+                        child: Text(network.name),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) =>
+                    setDialogState(() => secondId = value ?? secondId),
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                'A new combined network will be created. Both originals will remain unchanged.',
+                style: TextStyle(color: secondary, fontSize: 12),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('CANCEL'),
+            ),
+            FilledButton(
+              onPressed: firstId == secondId
+                  ? null
+                  : () => Navigator.pop(context, [firstId, secondId]),
+              child: const Text('CREATE MERGED COPY'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (selection == null || !context.mounted) return;
+    final first = networks.firstWhere((item) => item.id == selection[0]);
+    final second = networks.firstWhere((item) => item.id == selection[1]);
+    final merged = mergeNetworks(first, second);
+    networks.insert(0, merged);
+    await onChanged();
+    if (context.mounted) onOpen(merged);
+  }
 
   Future<void> importNetForgeFile(BuildContext context) async {
     try {
@@ -768,9 +1771,70 @@ class NetworksPage extends StatelessWidget {
     await Future<void>.delayed(const Duration(milliseconds: 350));
     controller.dispose();
     if (result == null || !context.mounted) return;
+    var destination = 'new';
+    if (networks.isNotEmpty) {
+      final choice = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Where should these devices go?'),
+          content: Text(
+            '${result.devices.length} devices were found in the notes.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('CANCEL'),
+            ),
+            OutlinedButton(
+              onPressed: () => Navigator.pop(context, 'existing'),
+              child: const Text('ADD TO SAVED'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, 'new'),
+              child: const Text('CREATE NEW'),
+            ),
+          ],
+        ),
+      );
+      if (choice == null || !context.mounted) return;
+      destination = choice;
+    }
+    if (destination == 'existing') {
+      final target = await showDialog<NetworkMap>(
+        context: context,
+        builder: (context) => SimpleDialog(
+          title: const Text('Add notes to…'),
+          children: networks
+              .map(
+                (network) => SimpleDialogOption(
+                  onPressed: () => Navigator.pop(context, network),
+                  child: ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(network.name),
+                    subtitle: Text('${network.devices.length} devices'),
+                  ),
+                ),
+              )
+              .toList(),
+        ),
+      );
+      if (target == null || !context.mounted) return;
+      mergeDevicesInto(target, result.devices);
+      final importedNotes = 'Imported scan notes:\n${result.rawText.trim()}';
+      if (!target.notes.contains(result.rawText.trim())) {
+        target.notes = target.notes.isEmpty
+            ? importedNotes
+            : '${target.notes}\n\n$importedNotes';
+      }
+      target.updatedAt = DateTime.now();
+      await onChanged();
+      if (context.mounted) onOpen(target);
+      return;
+    }
     final details = await _editNetworkDialog(
       context,
       initialName: 'Imported LAN',
+      initialSsid: currentSsid,
       initialNotes: result.rawText,
     );
     if (details == null) return;
@@ -830,6 +1894,17 @@ class NetworksPage extends StatelessWidget {
             label: const Text('IMPORT .NETFORGE FILE'),
           ),
         ),
+        if (networks.length >= 2) ...[
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => mergeSavedNetworks(context),
+              icon: const Icon(Icons.merge_rounded),
+              label: const Text('MERGE SAVED NETWORKS'),
+            ),
+          ),
+        ],
         const SizedBox(height: 22),
         SavedNetworksList(
           networks: networks,
@@ -840,6 +1915,7 @@ class NetworksPage extends StatelessWidget {
         QuickLanScanPanel(
           networks: networks,
           liveInventory: liveInventory,
+          currentSsid: currentSsid,
           onOpen: onOpen,
           onChanged: onChanged,
         ),
@@ -891,6 +1967,13 @@ class _SavedNetworksListState extends State<SavedNetworksList> {
     return confirmed == true;
   }
 
+  Future<void> deleteAfterConfirmation(NetworkMap network) async {
+    if (!await confirmDelete(network) || !mounted) return;
+    widget.networks.remove(network);
+    await widget.onChanged();
+    if (mounted) setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) {
     final visible = showAll ? widget.networks : widget.networks.take(3);
@@ -924,6 +2007,7 @@ class _SavedNetworksListState extends State<SavedNetworksList> {
               child: NetworkTile(
                 network: network,
                 onTap: () => widget.onOpen(network),
+                onLongPress: () => deleteAfterConfirmation(network),
               ),
             ),
           ),
@@ -952,11 +2036,13 @@ class QuickLanScanPanel extends StatefulWidget {
     super.key,
     required this.networks,
     required this.liveInventory,
+    required this.currentSsid,
     required this.onOpen,
     required this.onChanged,
   });
   final List<NetworkMap> networks;
   final LiveInventory liveInventory;
+  final String currentSsid;
   final ValueChanged<NetworkMap> onOpen;
   final Future<void> Function() onChanged;
 
@@ -965,17 +2051,26 @@ class QuickLanScanPanel extends StatefulWidget {
 }
 
 class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
-  final results = <ScannedHost>[];
   bool scanning = false;
   int checked = 0;
   String? error;
+
+  List<ScannedHost> get results => widget.liveInventory.devices
+      .map(
+        (device) => ScannedHost(
+          device.ip,
+          device.hostname.isEmpty ? device.ip : device.hostname,
+          List.of(device.ports),
+          mac: device.mac,
+        ),
+      )
+      .toList();
 
   Future<void> scan() async {
     if (scanning) return;
     setState(() {
       scanning = true;
       checked = 0;
-      results.clear();
       error = null;
     });
     try {
@@ -989,7 +2084,6 @@ class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
       if (mounted) {
         widget.liveInventory.observeHosts(found);
         setState(() {
-          results.addAll(found);
           checked = 254;
           scanning = false;
         });
@@ -1007,7 +2101,10 @@ class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
   Future<void> saveResults() async {
     final details = await _editNetworkDialog(
       context,
-      initialName: 'Scanned LAN',
+      initialName: widget.currentSsid.isEmpty
+          ? 'Scanned LAN'
+          : '${widget.currentSsid} LAN',
+      initialSsid: widget.currentSsid,
     );
     if (details == null || !mounted) return;
     final network = NetworkMap(
@@ -1021,81 +2118,117 @@ class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
     );
     widget.networks.insert(0, network);
     await widget.onChanged();
+    widget.liveInventory.clear();
     if (mounted) widget.onOpen(network);
   }
 
-  Future<void> showResult(ScannedHost host) async {
-    final openTools = await showModalBottomSheet<bool>(
+  Future<void> mergeResults() async {
+    if (results.isEmpty || widget.networks.isEmpty) return;
+    final target = await showDialog<NetworkMap>(
       context: context,
-      backgroundColor: surface,
-      showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              InkWell(
-                onTap: () => Navigator.pop(context, true),
-                borderRadius: BorderRadius.circular(8),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          host.ip,
-                          style: const TextStyle(
-                            color: accent,
-                            fontSize: 22,
-                            fontWeight: FontWeight.w900,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ),
-                      const Icon(Icons.construction_rounded, color: accent),
-                    ],
+      builder: (context) => SimpleDialog(
+        title: const Text('Merge Live LAN into…'),
+        children: widget.networks
+            .map(
+              (network) => SimpleDialogOption(
+                onPressed: () => Navigator.pop(context, network),
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(network.name),
+                  subtitle: Text(
+                    '${network.devices.length} devices'
+                    '${network.ssid.isEmpty ? '' : ' · ${network.ssid}'}',
                   ),
                 ),
               ),
-              Text(
-                host.hostname == host.ip
-                    ? guessProduct(host.ports)
-                    : host.hostname,
-                style: const TextStyle(color: secondary),
-              ),
-              const SizedBox(height: 18),
-              Text(
-                'ALL KNOWN OPEN PORTS (${host.ports.length})',
-                style: const TextStyle(
-                  color: secondary,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              const SizedBox(height: 8),
-              if (host.ports.isEmpty)
-                const Text('No open ports found in this scan.')
-              else
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: host.ports
-                      .map(
-                        (port) => Chip(
-                          label: Text('$port · ${serviceName(port)}'),
-                          side: const BorderSide(color: border),
-                        ),
-                      )
-                      .toList(),
-                ),
-            ],
+            )
+            .toList(),
+      ),
+    );
+    if (target == null || !mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Merge into saved network?'),
+        content: Text(
+          'Add ${results.length} Live LAN devices to “${target.name}”? '
+          'Existing documentation will be kept and open ports will be combined.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('CANCEL'),
           ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('MERGE'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    mergeDevicesInto(target, results.map((host) => host.toRecord()));
+    if (target.ssid.isEmpty && widget.currentSsid.isNotEmpty) {
+      target.ssid = widget.currentSsid;
+    }
+    target.updatedAt = DateTime.now();
+    await widget.onChanged();
+    widget.liveInventory.clear();
+    if (mounted) widget.onOpen(target);
+  }
+
+  Future<void> showResult(ScannedHost host) async {
+    await showDevice(
+      context,
+      host.toRecord(),
+      fresh: host,
+      onPing: () => checkResultAlive(host),
+      onScanAllPorts: () => scanResultPorts(host),
+    );
+  }
+
+  Future<void> scanResultPorts(
+    ScannedHost host, {
+    PortSelectionMode initialPortMode = PortSelectionMode.common,
+  }) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SimplePortScanner(
+          liveInventory: widget.liveInventory,
+          initialHost: host.ip,
+          initialPortMode: initialPortMode,
         ),
       ),
     );
-    if (openTools == true && mounted) await showResultTools(host);
+  }
+
+  Future<void> checkResultAlive(ScannedHost host) async {
+    final checks = await Future.wait(
+      host.ports.map(
+        (port) async => (port: port, probe: await _probe(host.ip, port)),
+      ),
+    );
+    final openPorts = [
+      for (final check in checks)
+        if (check.probe.open) check.port,
+    ];
+    final respondedOnListedPort = checks.any((check) => check.probe.reachable);
+    final alive = respondedOnListedPort || await pingHost(host.ip);
+    widget.liveInventory.replacePorts(host.ip, openPorts);
+    final mac = (await discoverNeighborMacs())[host.ip];
+    if (mac != null) widget.liveInventory.observeMac(host.ip, mac);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          alive
+              ? '${host.ip} is alive · ${openPorts.length} of '
+                    '${host.ports.length} listed ports still open.'
+              : '${host.ip} did not respond. It may be offline or blocking ping.',
+        ),
+      ),
+    );
   }
 
   Future<void> showResultTools(ScannedHost host) async {
@@ -1140,124 +2273,92 @@ class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
     );
     if (!mounted || tool == null) return;
     if (tool == 'ports') {
-      await Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => SimplePortScanner(
-            liveInventory: widget.liveInventory,
-            initialHost: host.ip,
-            onResults: (finding) {
-              final index = results.indexOf(host);
-              if (index < 0) return;
-              final ports = {...host.ports, ...finding.ports}.toList()..sort();
-              setState(() {
-                results[index] = ScannedHost(host.ip, host.hostname, ports);
-              });
-            },
-          ),
-        ),
-      );
+      await scanResultPorts(host);
     } else if (tool == 'dns') {
-      await showDnsLookup(
-        context,
-        widget.liveInventory,
-        initialInput: host.ip,
-        onResult: (ip, hostname) {
-          final index = results.indexOf(host);
-          if (index < 0 || ip != host.ip) return;
-          setState(() {
-            results[index] = ScannedHost(host.ip, hostname, host.ports);
-          });
-        },
-      );
+      await showDnsLookup(context, widget.liveInventory, initialInput: host.ip);
     } else if (tool == 'subnet') {
       await showSubnetCalculator(context, initialCidr: '${host.ip}/24');
     }
   }
 
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      const SectionHeader(title: 'Scan current LAN'),
-      const SizedBox(height: 6),
-      const Text(
-        'Results appear below and remain unsaved until you choose Save Network.',
-        style: TextStyle(color: secondary, fontSize: 12),
-      ),
-      const SizedBox(height: 12),
-      SizedBox(
-        width: double.infinity,
-        child: FilledButton.icon(
-          onPressed: scanning ? null : scan,
-          icon: Icon(scanning ? Icons.sync_rounded : Icons.radar_rounded),
-          label: Text(
-            scanning ? 'SCANNING $checked / 254' : 'SCAN CURRENT LAN',
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: widget.liveInventory,
+    builder: (context, _) => Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SectionHeader(title: 'Live LAN workspace'),
+        const SizedBox(height: 6),
+        const Text(
+          'Scans and global tools gather devices here. Nothing becomes a '
+          'saved network until you choose Save Network.',
+          style: TextStyle(color: secondary, fontSize: 12),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            onPressed: scanning ? null : scan,
+            icon: Icon(scanning ? Icons.sync_rounded : Icons.radar_rounded),
+            label: Text(
+              scanning ? 'SCANNING $checked / 254' : 'SCAN CURRENT LAN',
+            ),
           ),
         ),
-      ),
-      if (scanning) ...[
-        const SizedBox(height: 8),
-        LinearProgressIndicator(
-          value: checked / 254,
-          color: accent,
-          backgroundColor: border,
-        ),
-      ],
-      if (error != null) ...[
-        const SizedBox(height: 10),
-        Text(error!, style: const TextStyle(color: danger)),
-      ],
-      if (!scanning && results.isNotEmpty) ...[
-        const SizedBox(height: 16),
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                '${results.length} devices found',
-                style: const TextStyle(fontWeight: FontWeight.w800),
-              ),
-            ),
-            TextButton.icon(
-              onPressed: saveResults,
-              icon: const Icon(Icons.save_outlined),
-              label: const Text('SAVE NETWORK'),
-            ),
-          ],
-        ),
-        ...results.map(
-          (host) => ListTile(
-            onTap: () => showResult(host),
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.devices_rounded, color: accent),
-            title: Text(
-              host.ip,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-            subtitle: host.ports.isEmpty
-                ? null
-                : Text(
-                    host.ports.join(', '),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: secondary,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-            trailing: const Icon(Icons.chevron_right_rounded),
+        if (scanning) ...[
+          const SizedBox(height: 8),
+          LinearProgressIndicator(
+            value: checked / 254,
+            color: accent,
+            backgroundColor: border,
           ),
-        ),
+        ],
+        if (error != null) ...[
+          const SizedBox(height: 10),
+          Text(error!, style: const TextStyle(color: danger)),
+        ],
+        if (!scanning && results.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          Text(
+            '${results.length} devices found',
+            style: const TextStyle(fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              TextButton.icon(
+                onPressed: saveResults,
+                icon: const Icon(Icons.save_outlined),
+                label: const Text('SAVE AS NEW'),
+              ),
+              if (widget.networks.isNotEmpty)
+                TextButton.icon(
+                  onPressed: mergeResults,
+                  icon: const Icon(Icons.merge_rounded),
+                  label: const Text('MERGE INTO SAVED'),
+                ),
+            ],
+          ),
+          ...results.map((host) {
+            final device = host.toRecord();
+            return DeviceTile(
+              device: device,
+              status: DeviceStatus.active,
+              onTap: () => showResult(host),
+              onTools: () => showResultTools(host),
+              onPing: () => checkResultAlive(host),
+            );
+          }),
+        ],
+        if (!scanning && checked > 0 && results.isEmpty && error == null)
+          const EmptyMessage(
+            icon: Icons.search_off_rounded,
+            text: 'No devices responded to the scan.',
+          ),
       ],
-      if (!scanning && checked > 0 && results.isEmpty && error == null)
-        const EmptyMessage(
-          icon: Icons.search_off_rounded,
-          text: 'No devices responded to the scan.',
-        ),
-    ],
+    ),
   );
 }
 
@@ -1302,7 +2403,6 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
 
   Future<void> scan() async {
     if (scanning) return;
-    final isInitialScan = !hasRefreshed && widget.network.devices.isEmpty;
     setState(() {
       scanning = true;
       hasRefreshed = false;
@@ -1320,12 +2420,6 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
         },
       );
       if (!mounted) return;
-      widget.liveInventory.observeHosts(hosts);
-      if (isInitialScan && addFirstScanHosts(widget.network, hosts) > 0) {
-        widget.network.updatedAt = DateTime.now();
-        await widget.onChanged();
-        if (!mounted) return;
-      }
       final byIp = {for (final host in hosts) host.ip: host};
       final savedIps = widget.network.devices
           .map((device) => device.ip)
@@ -1418,15 +2512,16 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
   }
 
   Future<void> markDeviceActive(DeviceRecord device) async {
-    final live = widget.liveInventory.forIp(device.ip);
+    final latest = refreshed[device.ip];
     device
       ..isDead = false
       ..lastSeen = DateTime.now();
     missing.remove(device.ip);
     refreshed[device.ip] = ScannedHost(
       device.ip,
-      live?.hostname ?? device.name,
-      live == null ? List.of(device.ports) : List.of(live.ports),
+      latest?.hostname ?? device.name,
+      latest == null ? List.of(device.ports) : List.of(latest.ports),
+      mac: latest?.mac ?? device.mac,
     );
     await changed();
   }
@@ -1461,20 +2556,22 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
               ),
               const SizedBox(height: 4),
               const Text(
-                'Choose a tool. Results gathered here are saved back to this network.',
+                'Choose a tool. Detected changes stay pending until you approve them.',
                 style: TextStyle(color: secondary),
               ),
               const SizedBox(height: 12),
               ListTile(
                 leading: const Icon(Icons.radar_rounded),
                 title: const Text('Port scanner'),
-                subtitle: const Text('Scan ports and add open results'),
+                subtitle: const Text('Scan ports and review open results'),
                 onTap: () => Navigator.pop(context, 'ports'),
               ),
               ListTile(
                 leading: const Icon(Icons.travel_explore_rounded),
                 title: const Text('DNS lookup'),
-                subtitle: const Text('Find and save the device hostname'),
+                subtitle: const Text(
+                  'Look up a hostname without changing saved data',
+                ),
                 onTap: () => Navigator.pop(context, 'dns'),
               ),
               ListTile(
@@ -1490,41 +2587,56 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
     );
     if (!mounted || tool == null) return;
     if (tool == 'ports') {
-      await Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => SimplePortScanner(
-            liveInventory: widget.liveInventory,
-            initialHost: device.ip,
-            onResults: (result) async {
-              final mergedPorts = {...device.ports, ...result.ports}.toList()
-                ..sort();
-              device
-                ..ports = mergedPorts
-                ..lastSeen = DateTime.now()
-                ..isDead = false;
-              refreshed[device.ip] = result;
-              missing.remove(device.ip);
-              await changed();
-            },
-          ),
-        ),
-      );
+      await openDevicePortScanner(device);
     } else if (tool == 'dns') {
       await showDnsLookup(
         context,
         widget.liveInventory,
         initialInput: device.ip,
-        onResult: (ip, hostname) async {
+        recordInLiveInventory: false,
+        onResult: (ip, hostname) {
           if (ip != device.ip) return;
-          if (device.name.isEmpty) device.name = hostname;
-          device.lastSeen = DateTime.now();
-          await changed();
+          final current = refreshed[ip];
+          setState(() {
+            refreshed[ip] = ScannedHost(
+              ip,
+              hostname,
+              current == null ? List.of(device.ports) : List.of(current.ports),
+              mac: current?.mac ?? device.mac,
+            );
+          });
         },
       );
     } else if (tool == 'subnet') {
       await showSubnetCalculator(context, initialCidr: '${device.ip}/24');
     }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> openDevicePortScanner(
+    DeviceRecord device, {
+    bool scanAllPorts = false,
+  }) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SimplePortScanner(
+          liveInventory: widget.liveInventory,
+          initialHost: device.ip,
+          recordInLiveInventory: false,
+          initialPortMode: scanAllPorts
+              ? PortSelectionMode.all
+              : PortSelectionMode.common,
+          onResults: (result) {
+            if (!mounted) return;
+            setState(() {
+              refreshed[device.ip] = result;
+              missing.remove(device.ip);
+            });
+          },
+        ),
+      ),
+    );
     if (mounted) setState(() {});
   }
 
@@ -1767,16 +2879,7 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
           else
             ...widget.network.devices.map((device) {
               final isMissing = missing.contains(device.ip);
-              final live = widget.liveInventory.forIp(device.ip);
-              final fresh =
-                  refreshed[device.ip] ??
-                  (live == null
-                      ? null
-                      : ScannedHost(
-                          live.ip,
-                          live.hostname,
-                          List.of(live.ports),
-                        ));
+              final fresh = refreshed[device.ip];
               final portsChanged =
                   fresh != null && !samePorts(device.ports, fresh.ports);
               final status = device.isDead
@@ -1841,6 +2944,31 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                     fresh: fresh,
                     onRename: () => renameDevice(device),
                     onEdit: () => editDevice(device),
+                    onScanAllPorts: () => openDevicePortScanner(device),
+                    onAddNewPorts: fresh == null
+                        ? null
+                        : () async {
+                            final mergedPorts = {
+                              ...device.ports,
+                              ...fresh.ports,
+                            }.toList()..sort();
+                            device
+                              ..ports = mergedPorts
+                              ..lastSeen = DateTime.now();
+                            await changed();
+                          },
+                    onApplyHostname:
+                        fresh == null ||
+                            fresh.hostname.isEmpty ||
+                            fresh.hostname == fresh.ip ||
+                            fresh.hostname == device.name
+                        ? null
+                        : () async {
+                            device
+                              ..name = fresh.hostname
+                              ..lastSeen = DateTime.now();
+                            await changed();
+                          },
                     onDelete: () async {
                       widget.network.devices.remove(device);
                       missing.remove(device.ip);
@@ -1852,10 +2980,6 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                             device
                               ..ports = List.of(fresh.ports)
                               ..lastSeen = DateTime.now();
-                            if (fresh.hostname.isNotEmpty &&
-                                device.name.isEmpty) {
-                              device.name = fresh.hostname;
-                            }
                             await changed();
                           },
                   ),
@@ -1920,6 +3044,7 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                     device,
                     onRename: () => renameDevice(device),
                     onEdit: () => editDevice(device),
+                    onScanAllPorts: () => openDevicePortScanner(device),
                     onDelete: () async {
                       widget.network.removedDevices.remove(device);
                       await changed();
@@ -1980,6 +3105,7 @@ class DeviceTile extends StatelessWidget {
     required this.status,
     required this.onTap,
     required this.onTools,
+    this.onPing,
     this.onKeep,
     this.onDelete,
   });
@@ -1988,6 +3114,7 @@ class DeviceTile extends StatelessWidget {
   final DeviceStatus status;
   final VoidCallback onTap;
   final VoidCallback onTools;
+  final VoidCallback? onPing;
   final VoidCallback? onKeep;
   final VoidCallback? onDelete;
 
@@ -2013,6 +3140,7 @@ class DeviceTile extends StatelessWidget {
           children: [
             ListTile(
               onTap: onTap,
+              onLongPress: () => _copyDevice(context),
               leading: Icon(
                 status == DeviceStatus.missing || status == DeviceStatus.dead
                     ? Icons.wifi_off_rounded
@@ -2029,6 +3157,7 @@ class DeviceTile extends StatelessWidget {
                   const SizedBox(height: 3),
                   InkWell(
                     onTap: onTools,
+                    onLongPress: () => _copyIp(context),
                     borderRadius: BorderRadius.circular(6),
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
@@ -2059,7 +3188,18 @@ class DeviceTile extends StatelessWidget {
                     ),
                 ],
               ),
-              trailing: const Icon(Icons.chevron_right_rounded),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (onPing != null)
+                    IconButton(
+                      onPressed: onPing,
+                      tooltip: 'Refresh listed ports for ${device.ip}',
+                      icon: const Icon(Icons.network_ping_rounded),
+                    ),
+                  const Icon(Icons.chevron_right_rounded),
+                ],
+              ),
             ),
             if (status == DeviceStatus.missing)
               Padding(
@@ -2088,6 +3228,30 @@ class DeviceTile extends StatelessWidget {
       ),
     );
   }
+
+  Future<void> _copyIp(BuildContext context) async {
+    await Clipboard.setData(ClipboardData(text: device.ip));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Copied ${device.ip}')));
+  }
+
+  Future<void> _copyDevice(BuildContext context) async {
+    final details = [
+      'Name: ${device.title}',
+      'IP: ${device.ip}',
+      'MAC: ${device.mac.isEmpty ? 'Not available' : device.mac}',
+      'Product: ${device.product.isEmpty ? 'Unidentified' : device.product}',
+      'Ports: ${device.ports.isEmpty ? 'None' : device.ports.join(', ')}',
+      if (device.notes.isNotEmpty) 'Notes: ${device.notes}',
+    ].join('\n');
+    await Clipboard.setData(ClipboardData(text: details));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Copied all info for ${device.ip}')));
+  }
 }
 
 class MappingToolsPage extends StatelessWidget {
@@ -2096,11 +3260,13 @@ class MappingToolsPage extends StatelessWidget {
     required this.liveInventory,
     required this.onCreateNetwork,
     required this.onScanSubnet,
+    required this.onReviewPortResults,
   });
 
   final LiveInventory liveInventory;
   final VoidCallback onCreateNetwork;
   final VoidCallback onScanSubnet;
+  final VoidCallback onReviewPortResults;
 
   @override
   Widget build(BuildContext context) => SafeArea(
@@ -2135,7 +3301,10 @@ class MappingToolsPage extends StatelessWidget {
           onTap: () => Navigator.push(
             context,
             MaterialPageRoute(
-              builder: (_) => SimplePortScanner(liveInventory: liveInventory),
+              builder: (_) => SimplePortScanner(
+                liveInventory: liveInventory,
+                onReviewResults: onReviewPortResults,
+              ),
             ),
           ),
         ),
@@ -2656,11 +3825,17 @@ class SimplePortScanner extends StatefulWidget {
     super.key,
     required this.liveInventory,
     this.initialHost = '',
+    this.initialPortMode = PortSelectionMode.common,
+    this.recordInLiveInventory = true,
     this.onResults,
+    this.onReviewResults,
   });
   final LiveInventory liveInventory;
   final String initialHost;
+  final PortSelectionMode initialPortMode;
+  final bool recordInLiveInventory;
   final ValueChanged<ScannedHost>? onResults;
+  final VoidCallback? onReviewResults;
 
   @override
   State<SimplePortScanner> createState() => _SimplePortScannerState();
@@ -2685,7 +3860,7 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
     selectedTarget = widget.initialHost.isEmpty
         ? scanLanTarget
         : widget.initialHost;
-    portMode = PortSelectionMode.common;
+    portMode = widget.initialPortMode;
   }
 
   @override
@@ -2746,34 +3921,35 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
       }
       for (final address in scanTargets) {
         final open = <int>[];
+        var reachable = false;
         for (var offset = 0; offset < scanPorts.length; offset += 96) {
           final batch = scanPorts.skip(offset).take(96).toList();
-          final hits = <int>[];
-          await Future.wait(
-            batch.map((port) async {
-              try {
-                final socket = await Socket.connect(
-                  address,
-                  port,
-                  timeout: const Duration(milliseconds: 500),
-                );
-                socket.destroy();
-                hits.add(port);
-              } catch (_) {}
-            }),
+          final probes = await Future.wait(
+            batch.map(
+              (port) async => (port: port, result: await _probe(address, port)),
+            ),
           );
-          open.addAll(hits);
+          open.addAll([
+            for (final probe in probes)
+              if (probe.result.open) probe.port,
+          ]);
+          reachable =
+              reachable || probes.any((probe) => probe.result.reachable);
           if (mounted) {
             setState(() {
               checked += batch.length;
-              if (open.isNotEmpty) {
+              if (reachable) {
                 results[address] = List.of(open)..sort();
               }
             });
           }
         }
-        widget.liveInventory.observePorts(address, open);
-        widget.onResults?.call(ScannedHost(address, address, List.of(open)));
+        if (reachable) {
+          if (widget.recordInLiveInventory) {
+            widget.liveInventory.observePorts(address, open);
+          }
+          widget.onResults?.call(ScannedHost(address, address, List.of(open)));
+        }
       }
     } catch (error) {
       if (mounted) {
@@ -2839,6 +4015,16 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
                 ? null
                 : (selection) => setState(() => portMode = selection.first),
           ),
+          const SizedBox(height: 8),
+          Text(
+            portMode == PortSelectionMode.common
+                ? '${discoveryPorts.length} common ports selected. '
+                      'A LAN scan checks each port against every LAN address.'
+                : portMode == PortSelectionMode.all
+                ? '65,535 ports selected for the chosen target.'
+                : '${selectedPorts().length} custom ports selected.',
+            style: const TextStyle(color: secondary, fontSize: 12),
+          ),
           if (portMode == PortSelectionMode.custom) ...[
             const SizedBox(height: 12),
             TextField(
@@ -2861,7 +4047,9 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
           FilledButton.icon(
             onPressed: scanning ? null : scan,
             icon: const Icon(Icons.radar_rounded),
-            label: Text(scanning ? '$checked / $total checks' : 'SCAN'),
+            label: Text(
+              scanning ? '$checked / $total connection checks' : 'SCAN',
+            ),
           ),
           if (scanning && total > 0) ...[
             const SizedBox(height: 8),
@@ -2872,57 +4060,104 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
             ),
           ],
           const SizedBox(height: 18),
-          ...results.entries.map(
-            (entry) => ExpansionTile(
-              leading: const Icon(Icons.check_circle_rounded, color: accent),
-              title: Text(
-                entry.key,
-                style: const TextStyle(
-                  fontFamily: 'monospace',
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              subtitle: Text('${entry.value.length} open ports'),
-              children: entry.value
-                  .map(
-                    (port) => ListTile(
-                      title: Text('TCP $port'),
-                      subtitle: Text(serviceName(port)),
-                    ),
-                  )
-                  .toList(),
-            ),
-          ),
+          PortScanResults(results: results),
           if (!scanning && checked > 0 && results.isEmpty)
             const EmptyMessage(
               icon: Icons.block_rounded,
               text: 'No selected TCP ports were open.',
             ),
+          if (!scanning &&
+              results.isNotEmpty &&
+              widget.onReviewResults != null) ...[
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: () {
+                  Navigator.pop(context);
+                  widget.onReviewResults?.call();
+                },
+                icon: const Icon(Icons.save_alt_rounded),
+                label: const Text('SAVE OR MERGE RESULTS'),
+              ),
+            ),
+          ],
         ],
       ),
     );
   }
 }
 
-class ScannedHost {
-  const ScannedHost(this.ip, this.hostname, this.ports);
-  final String ip;
-  final String hostname;
-  final List<int> ports;
+class PortScanResults extends StatelessWidget {
+  const PortScanResults({super.key, required this.results});
 
-  DeviceRecord toRecord() => DeviceRecord(
-    ip: ip,
-    name: hostname == ip ? '' : hostname,
-    product: guessProduct(ports),
-    ports: List.of(ports),
+  final Map<String, List<int>> results;
+
+  Future<void> copy(BuildContext context, String text, String message) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    children: results.entries
+        .map(
+          (entry) => ExpansionTile(
+            leading: const Icon(Icons.check_circle_rounded, color: accent),
+            title: Text(
+              entry.key,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            subtitle: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onLongPress: () => copy(
+                context,
+                entry.value.join(', '),
+                'Copied all ${entry.value.length} open ports',
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  '${entry.value.length} open ports · Hold to copy all',
+                ),
+              ),
+            ),
+            children: entry.value
+                .map(
+                  (port) => ListTile(
+                    title: Text('TCP $port'),
+                    subtitle: Text('${serviceName(port)} · Hold to copy'),
+                    onLongPress: () =>
+                        copy(context, '$port', 'Copied port $port'),
+                  ),
+                )
+                .toList(),
+          ),
+        )
+        .toList(),
   );
 }
 
-int addFirstScanHosts(NetworkMap network, Iterable<ScannedHost> hosts) {
-  if (network.devices.isNotEmpty) return 0;
-  final discovered = hosts.map((host) => host.toRecord()).toList();
-  network.devices.addAll(discovered);
-  return discovered.length;
+class ScannedHost {
+  const ScannedHost(this.ip, this.hostname, this.ports, {this.mac = ''});
+  final String ip;
+  final String hostname;
+  final List<int> ports;
+  final String mac;
+
+  DeviceRecord toRecord() => DeviceRecord(
+    ip: ip,
+    mac: mac,
+    name: hostname == ip ? '' : hostname,
+    product: guessProduct(ports, hostname: hostname, mac: mac),
+    ports: List.of(ports),
+  );
 }
 
 const discoveryPorts = [
@@ -2991,8 +4226,66 @@ Future<List<ScannedHost>> discoverLan({
       }),
     );
   }
-  found.sort((a, b) => lastOctet(a.ip).compareTo(lastOctet(b.ip)));
-  return found;
+  final macs = await discoverNeighborMacs();
+  final resolved =
+      found
+          .map(
+            (host) => ScannedHost(
+              host.ip,
+              host.hostname,
+              host.ports,
+              mac: macs[host.ip] ?? '',
+            ),
+          )
+          .toList()
+        ..sort((a, b) => lastOctet(a.ip).compareTo(lastOctet(b.ip)));
+  return resolved;
+}
+
+Future<Map<String, String>> discoverNeighborMacs() async {
+  final output = StringBuffer();
+  try {
+    final arpFile = File('/proc/net/arp');
+    if (await arpFile.exists()) output.writeln(await arpFile.readAsString());
+  } catch (_) {}
+  try {
+    final result = await Process.run(
+      Platform.isWindows ? 'arp' : 'arp',
+      Platform.isWindows ? ['-a'] : ['-an'],
+    ).timeout(const Duration(seconds: 2));
+    output.writeln(result.stdout);
+  } catch (_) {}
+
+  final addresses = <String, String>{};
+  final ipPattern = RegExp(r'\b(?:\d{1,3}\.){3}\d{1,3}\b');
+  final macPattern = RegExp(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b');
+  for (final line in output.toString().split('\n')) {
+    final ip = ipPattern.firstMatch(line)?.group(0);
+    final mac = macPattern.firstMatch(line)?.group(0);
+    if (ip != null && mac != null && mac != '00:00:00:00:00:00') {
+      addresses[ip] = mac.replaceAll('-', ':').toUpperCase();
+    }
+  }
+  return addresses;
+}
+
+Future<bool> pingHost(String ip) async {
+  try {
+    final arguments = Platform.isWindows
+        ? ['-n', '1', '-w', '1500', ip]
+        : Platform.isMacOS || Platform.isIOS
+        ? ['-c', '1', '-W', '1500', ip]
+        : ['-c', '1', '-W', '1', ip];
+    final result = await Process.run(
+      Platform.isAndroid ? '/system/bin/ping' : 'ping',
+      arguments,
+    ).timeout(const Duration(seconds: 3));
+    if (result.exitCode == 0) return true;
+  } catch (_) {}
+  final probes = await Future.wait(
+    discoveryPorts.take(6).map((port) => _probe(ip, port)),
+  );
+  return probes.any((probe) => probe.reachable);
 }
 
 class _Probe {
@@ -3109,15 +4402,36 @@ String serviceName(int port) {
   return names[port] ?? 'Unknown service';
 }
 
-String guessProduct(List<int> ports) {
+String guessProduct(List<int> ports, {String hostname = '', String mac = ''}) {
   final set = ports.toSet();
+  final host = hostname.toLowerCase();
+  if (host.contains('printer') ||
+      host.contains('epson') ||
+      host.contains('canon') ||
+      host.contains('brother') ||
+      host.contains('hp-')) {
+    return 'Likely printer';
+  }
+  if (host.contains('roku') ||
+      host.contains('tv') ||
+      host.contains('chromecast')) {
+    return 'Streaming or smart TV device';
+  }
+  if (host.contains('iphone') ||
+      host.contains('ipad') ||
+      host.contains('android') ||
+      host.contains('phone')) {
+    return 'Phone or tablet';
+  }
   if (set.contains(5555) || set.contains(5037)) return 'Android / ADB device';
   if (set.contains(9100) || set.contains(631)) return 'Likely printer';
   if (set.contains(445) || set.contains(139)) return 'File-sharing device';
   if (set.contains(53)) return 'Router or DNS device';
+  if (set.contains(548)) return 'Apple file-sharing device';
   if (set.any({80, 443, 8080, 8443}.contains)) return 'Web-enabled device';
   if (set.contains(22)) return 'SSH-enabled device';
-  return 'Unknown network device';
+  if (mac.isNotEmpty) return 'Identified LAN device';
+  return 'Reachable network device';
 }
 
 bool samePorts(List<int> a, List<int> b) =>
@@ -3420,12 +4734,20 @@ Future<void> showDevice(
   BuildContext context,
   DeviceRecord device, {
   ScannedHost? fresh,
-  required VoidCallback onRename,
-  required VoidCallback onEdit,
-  required VoidCallback onDelete,
+  VoidCallback? onRename,
+  VoidCallback? onEdit,
+  VoidCallback? onPing,
+  required VoidCallback onScanAllPorts,
+  VoidCallback? onDelete,
+  VoidCallback? onAddNewPorts,
   VoidCallback? onApplyPorts,
+  VoidCallback? onApplyHostname,
 }) async {
-  await showModalBottomSheet<void>(
+  final savedPorts = device.ports.toSet();
+  final latestPorts = fresh?.ports.toSet() ?? const <int>{};
+  final newPorts = latestPorts.difference(savedPorts);
+  final closedPorts = savedPorts.difference(latestPorts);
+  final action = await showModalBottomSheet<_DeviceSheetAction>(
     context: context,
     isScrollControlled: true,
     backgroundColor: surface,
@@ -3438,10 +4760,11 @@ Future<void> showDevice(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             InkWell(
-              onTap: () {
-                Navigator.pop(context);
-                onRename();
-              },
+              onTap: onRename == null
+                  ? null
+                  : () {
+                      Navigator.pop(context, _DeviceSheetAction.rename);
+                    },
               borderRadius: BorderRadius.circular(8),
               child: Padding(
                 padding: const EdgeInsets.symmetric(vertical: 6),
@@ -3458,15 +4781,17 @@ Future<void> showDevice(
                         ),
                       ),
                     ),
-                    const Icon(Icons.edit_outlined, color: accent),
+                    if (onRename != null)
+                      const Icon(Icons.edit_outlined, color: accent),
                   ],
                 ),
               ),
             ),
-            const Text(
-              'Tap the name to rename this device',
-              style: TextStyle(color: secondary, fontSize: 11),
-            ),
+            if (onRename != null)
+              const Text(
+                'Tap the name to rename this device',
+                style: TextStyle(color: secondary, fontSize: 11),
+              ),
             const SizedBox(height: 16),
             DetailRow(label: 'IP ADDRESS', value: device.ip),
             DetailRow(
@@ -3477,88 +4802,299 @@ Future<void> showDevice(
               label: 'PRODUCT',
               value: device.product.isEmpty ? 'Unidentified' : device.product,
             ),
-            DetailRow(
-              label: 'SAVED PORTS',
-              value: device.ports.isEmpty ? 'None' : device.ports.join(', '),
-            ),
-            if (fresh != null)
+            if (fresh == null)
               DetailRow(
-                label: 'LATEST PORTS',
-                value: fresh.ports.isEmpty ? 'None' : fresh.ports.join(', '),
-              ),
+                label: 'SAVED PORTS',
+                value: device.ports.isEmpty ? 'None' : device.ports.join(', '),
+              )
+            else
+              PortStatusReview(saved: device.ports, latest: fresh.ports),
             if (device.notes.isNotEmpty)
               DetailRow(label: 'NOTES', value: device.notes),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () {
-                      Navigator.pop(context);
-                      onEdit();
-                    },
-                    icon: const Icon(Icons.edit_outlined),
-                    label: const Text('EDIT'),
+            if (onApplyHostname != null) ...[
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: warning.withValues(alpha: .08),
+                  border: Border.all(color: warning),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  'DISCOVERED HOSTNAME\n${fresh!.hostname}',
+                  style: const TextStyle(
+                    color: warning,
+                    fontWeight: FontWeight.w800,
                   ),
                 ),
-                if (onApplyPorts != null) ...[
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: () {
-                        Navigator.pop(context);
-                        onApplyPorts();
-                      },
-                      icon: const Icon(Icons.sync_rounded),
-                      label: const Text('APPLY PORTS'),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context, _DeviceSheetAction.applyHostname);
+                  },
+                  icon: const Icon(Icons.dns_outlined),
+                  label: const Text('USE DISCOVERED HOSTNAME'),
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+            if (fresh != null &&
+                (newPorts.isNotEmpty || closedPorts.isNotEmpty)) ...[
+              if (newPorts.isNotEmpty && onAddNewPorts != null)
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(context, _DeviceSheetAction.addNewPorts);
+                    },
+                    icon: const Icon(Icons.add_rounded),
+                    label: Text(
+                      closedPorts.isEmpty
+                          ? 'ADD NEW PORTS'
+                          : 'ADD NEW · KEEP CLOSED PORTS',
                     ),
                   ),
-                ],
-              ],
-            ),
-            const SizedBox(height: 10),
+                ),
+              if (newPorts.isNotEmpty && onAddNewPorts != null)
+                const SizedBox(height: 8),
+              if (onApplyPorts != null)
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    style: closedPorts.isEmpty
+                        ? null
+                        : FilledButton.styleFrom(backgroundColor: danger),
+                    onPressed: () {
+                      Navigator.pop(context, _DeviceSheetAction.applyPorts);
+                    },
+                    icon: Icon(
+                      closedPorts.isEmpty
+                          ? Icons.sync_rounded
+                          : Icons.delete_sweep_outlined,
+                    ),
+                    label: Text(
+                      closedPorts.isEmpty
+                          ? 'SAVE LATEST PORTS'
+                          : 'SYNC · REMOVE CLOSED PORTS',
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 10),
+            ],
+            if (onPing != null) ...[
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context, _DeviceSheetAction.ping);
+                  },
+                  icon: const Icon(Icons.network_ping_rounded),
+                  label: const Text('REFRESH LISTED PORTS / CHECK ALIVE'),
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
             SizedBox(
               width: double.infinity,
-              child: TextButton.icon(
-                style: TextButton.styleFrom(foregroundColor: danger),
-                onPressed: () async {
-                  final confirmed = await showDialog<bool>(
-                    context: context,
-                    builder: (dialogContext) => AlertDialog(
-                      title: const Text('Delete this device?'),
-                      content: Text(
-                        '${device.title} (${device.ip}) will be removed from this saved network.',
-                      ),
-                      actions: [
-                        TextButton(
-                          onPressed: () => Navigator.pop(dialogContext, false),
-                          child: const Text('CANCEL'),
-                        ),
-                        FilledButton(
-                          onPressed: () => Navigator.pop(dialogContext, true),
-                          style: FilledButton.styleFrom(
-                            backgroundColor: danger,
-                          ),
-                          child: const Text('DELETE'),
-                        ),
-                      ],
-                    ),
-                  );
-                  if (confirmed == true && context.mounted) {
-                    Navigator.pop(context);
-                    await Future<void>.delayed(
-                      const Duration(milliseconds: 350),
-                    );
-                    onDelete();
-                  }
+              child: FilledButton.icon(
+                onPressed: () {
+                  Navigator.pop(context, _DeviceSheetAction.scanAllPorts);
                 },
-                icon: const Icon(Icons.delete_outline_rounded),
-                label: const Text('DELETE DEVICE'),
+                icon: const Icon(Icons.radar_rounded),
+                label: const Text('PORT SCANNER'),
               ),
             ),
+            const SizedBox(height: 10),
+            if (onEdit != null) ...[
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context, _DeviceSheetAction.edit);
+                  },
+                  icon: const Icon(Icons.edit_outlined),
+                  label: const Text('EDIT'),
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+            if (onDelete != null)
+              SizedBox(
+                width: double.infinity,
+                child: TextButton.icon(
+                  style: TextButton.styleFrom(foregroundColor: danger),
+                  onPressed: () async {
+                    final confirmed = await showDialog<bool>(
+                      context: context,
+                      builder: (dialogContext) => AlertDialog(
+                        title: const Text('Delete this device?'),
+                        content: Text(
+                          '${device.title} (${device.ip}) will be removed from this saved network.',
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () =>
+                                Navigator.pop(dialogContext, false),
+                            child: const Text('CANCEL'),
+                          ),
+                          FilledButton(
+                            onPressed: () => Navigator.pop(dialogContext, true),
+                            style: FilledButton.styleFrom(
+                              backgroundColor: danger,
+                            ),
+                            child: const Text('DELETE'),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirmed == true && context.mounted) {
+                      Navigator.pop(context);
+                      await Future<void>.delayed(
+                        const Duration(milliseconds: 350),
+                      );
+                      onDelete();
+                    }
+                  },
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  label: const Text('DELETE DEVICE'),
+                ),
+              ),
           ],
         ),
       ),
+    ),
+  );
+
+  if (!context.mounted) return;
+  switch (action) {
+    case _DeviceSheetAction.rename:
+      onRename?.call();
+    case _DeviceSheetAction.edit:
+      onEdit?.call();
+    case _DeviceSheetAction.scanAllPorts:
+      onScanAllPorts();
+    case _DeviceSheetAction.ping:
+      onPing?.call();
+    case _DeviceSheetAction.addNewPorts:
+      onAddNewPorts?.call();
+    case _DeviceSheetAction.applyPorts:
+      onApplyPorts?.call();
+    case _DeviceSheetAction.applyHostname:
+      onApplyHostname?.call();
+    case null:
+      break;
+  }
+}
+
+enum _DeviceSheetAction {
+  rename,
+  edit,
+  scanAllPorts,
+  ping,
+  addNewPorts,
+  applyPorts,
+  applyHostname,
+}
+
+class PortStatusReview extends StatelessWidget {
+  const PortStatusReview({
+    super.key,
+    required this.saved,
+    required this.latest,
+  });
+
+  final List<int> saved;
+  final List<int> latest;
+
+  @override
+  Widget build(BuildContext context) {
+    final savedSet = saved.toSet();
+    final latestSet = latest.toSet();
+    final stillOpen = savedSet.intersection(latestSet).toList()..sort();
+    final newPorts = latestSet.difference(savedSet).toList()..sort();
+    final closed = savedSet.difference(latestSet).toList()..sort();
+
+    if (stillOpen.isEmpty && newPorts.isEmpty && closed.isEmpty) {
+      return const DetailRow(label: 'PORT STATUS', value: 'No ports found');
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (stillOpen.isNotEmpty)
+          _PortStatusGroup(
+            label: 'STILL OPEN',
+            ports: stillOpen,
+            color: accent,
+          ),
+        if (newPorts.isNotEmpty)
+          _PortStatusGroup(
+            label: 'NEW · NOT SAVED',
+            ports: newPorts,
+            color: warning,
+          ),
+        if (closed.isNotEmpty)
+          _PortStatusGroup(
+            label: 'NO LONGER OPEN · STILL SAVED',
+            ports: closed,
+            color: danger,
+          ),
+      ],
+    );
+  }
+}
+
+class _PortStatusGroup extends StatelessWidget {
+  const _PortStatusGroup({
+    required this.label,
+    required this.ports,
+    required this.color,
+  });
+
+  final String label;
+  final List<int> ports;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 9),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: color,
+            fontSize: 10,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+        const SizedBox(height: 5),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: ports
+              .map(
+                (port) => Chip(
+                  visualDensity: VisualDensity.compact,
+                  backgroundColor: color.withValues(alpha: .1),
+                  side: BorderSide(color: color),
+                  label: Text(
+                    '$port',
+                    style: TextStyle(
+                      color: color,
+                      fontFamily: 'monospace',
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              )
+              .toList(),
+        ),
+      ],
     ),
   );
 }
@@ -3567,6 +5103,7 @@ Future<void> showDnsLookup(
   BuildContext context,
   LiveInventory liveInventory, {
   String initialInput = '',
+  bool recordInLiveInventory = true,
   void Function(String ip, String hostname)? onResult,
 }) async {
   final input = TextEditingController(text: initialInput);
@@ -3595,21 +5132,36 @@ Future<void> showDnsLookup(
             const SizedBox(height: 12),
             FilledButton(
               onPressed: () async {
+                final value = input.text.trim();
+                if (value.isEmpty) {
+                  setModalState(
+                    () => result = 'Enter a hostname or IP address.',
+                  );
+                  return;
+                }
                 try {
-                  final value = input.text.trim();
                   final address = InternetAddress.tryParse(value);
                   final answers = address == null
-                      ? await InternetAddress.lookup(value)
-                      : [await address.reverse()];
+                      ? await InternetAddress.lookup(
+                          value,
+                        ).timeout(const Duration(seconds: 8))
+                      : [
+                          await address.reverse().timeout(
+                            const Duration(seconds: 8),
+                          ),
+                        ];
                   for (final answer in answers) {
                     if (answer.host != answer.address) {
-                      liveInventory.observeHostname(
-                        answer.address,
-                        answer.host,
-                      );
+                      if (recordInLiveInventory) {
+                        liveInventory.observeHostname(
+                          answer.address,
+                          answer.host,
+                        );
+                      }
                       onResult?.call(answer.address, answer.host);
                     }
                   }
+                  if (!context.mounted) return;
                   setModalState(
                     () => result = answers
                         .map(
@@ -3619,8 +5171,15 @@ Future<void> showDnsLookup(
                         )
                         .join('\n'),
                   );
-                } catch (error) {
-                  setModalState(() => result = 'Lookup failed: $error');
+                } on SocketException {
+                  if (!context.mounted) return;
+                  setModalState(() => result = dnsLookupFailureMessage(value));
+                } on TimeoutException {
+                  if (!context.mounted) return;
+                  setModalState(
+                    () => result =
+                        'The DNS lookup timed out. Check your network connection and try again.',
+                  );
                 }
               },
               child: const Text('LOOK UP'),
@@ -3636,6 +5195,14 @@ Future<void> showDnsLookup(
   );
   await Future<void>.delayed(const Duration(milliseconds: 350));
   input.dispose();
+}
+
+String dnsLookupFailureMessage(String value) {
+  if (InternetAddress.tryParse(value) != null) {
+    return 'No reverse DNS hostname was found for $value.\n'
+        'This device may not publish a hostname, but it can still be online.';
+  }
+  return 'Could not resolve “$value”. Check the hostname and your network connection.';
 }
 
 Future<void> showSubnetCalculator(
@@ -3835,51 +5402,78 @@ class SummaryCard extends StatelessWidget {
     required this.label,
     required this.value,
     required this.icon,
+    this.onTap,
   });
   final String label;
   final String value;
   final IconData icon;
+  final VoidCallback? onTap;
 
   @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.all(16),
-    decoration: BoxDecoration(
-      color: surface,
-      border: Border.all(color: border),
+  Widget build(BuildContext context) => Material(
+    color: surface,
+    shape: RoundedRectangleBorder(
       borderRadius: BorderRadius.circular(15),
+      side: const BorderSide(color: border),
     ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(icon, color: accent),
-        const SizedBox(height: 14),
-        Text(
-          value,
-          style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w900),
+    clipBehavior: Clip.antiAlias,
+    child: InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: accent),
+            const SizedBox(height: 14),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w900),
+            ),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    style: const TextStyle(
+                      color: secondary,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                if (onTap != null)
+                  const Icon(
+                    Icons.chevron_right_rounded,
+                    color: secondary,
+                    size: 17,
+                  ),
+              ],
+            ),
+          ],
         ),
-        Text(
-          label,
-          style: const TextStyle(
-            color: secondary,
-            fontSize: 10,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-      ],
+      ),
     ),
   );
 }
 
 class NetworkTile extends StatelessWidget {
-  const NetworkTile({super.key, required this.network, required this.onTap});
+  const NetworkTile({
+    super.key,
+    required this.network,
+    required this.onTap,
+    this.onLongPress,
+  });
   final NetworkMap network;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
 
   @override
   Widget build(BuildContext context) => Container(
     margin: const EdgeInsets.only(bottom: 9),
     child: ListTile(
       onTap: onTap,
+      onLongPress: onLongPress,
       tileColor: surface,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(14),

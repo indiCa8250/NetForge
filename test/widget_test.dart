@@ -38,6 +38,118 @@ void main() {
     expect(find.text('Test WiFi'), findsOneWidget);
   });
 
+  testWidgets('home network count opens the networks list', (tester) async {
+    await tester.pumpWidget(const LanMapperApp());
+    await tester.pumpAndSettle();
+
+    expect(
+      tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
+      0,
+    );
+    await tester.tap(find.text('NETWORKS'));
+    await tester.pumpAndSettle();
+
+    expect(
+      tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
+      2,
+    );
+    expect(find.text('No networks saved yet.'), findsOneWidget);
+  });
+
+  testWidgets('secret navigation sequence opens notes and close resets it', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const LanMapperApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Home'));
+    await tester.tap(find.text('Networks'));
+    await tester.tap(find.text('Networks'));
+    await tester.tap(find.text('Tools'));
+    await tester.tap(find.text('Tools'));
+    await tester.tap(find.text('Tools'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Private files'), findsOneWidget);
+    expect(find.text('NEW NOTE'), findsNothing);
+    expect(find.byType(NavigationBar), findsNothing);
+
+    await tester.longPress(
+      find.text('This folder is empty. Hold here to add something.'),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('New note'), findsOneWidget);
+    expect(find.text('New folder'), findsOneWidget);
+    expect(find.text('Add images'), findsOneWidget);
+    await tester.tap(find.text('New note'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Title *'),
+      'Private reminder',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Note'),
+      'Remember this text.',
+    );
+    await tester.tap(find.text('SAVE'));
+    await tester.pumpAndSettle();
+    expect(find.text('Private reminder'), findsOneWidget);
+
+    await tester.tap(find.text('Private reminder'));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('Edit note'), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is SelectableText && widget.data == 'Remember this text.',
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.byTooltip('Close viewer'));
+    await tester.pumpAndSettle();
+
+    await tester.longPressAt(const Offset(700, 450));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('New folder'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Folder name *'),
+      'Pictures',
+    );
+    await tester.tap(find.text('CREATE'));
+    await tester.pumpAndSettle();
+    expect(find.text('Pictures'), findsOneWidget);
+
+    await tester.longPress(find.text('Pictures'));
+    await tester.pump();
+    expect(find.text('1 selected'), findsOneWidget);
+    await tester.tap(find.text('Private reminder'));
+    await tester.pump();
+    expect(find.text('2 selected'), findsOneWidget);
+    expect(find.byTooltip('Delete selected'), findsOneWidget);
+    await tester.tap(find.byTooltip('Cancel selection'));
+    await tester.pump();
+
+    await tester.tap(find.text('Pictures'));
+    await tester.pumpAndSettle();
+    expect(find.text('Pictures'), findsOneWidget);
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.text('Private files'), findsOneWidget);
+
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byType(NavigationBar), findsOneWidget);
+    expect(
+      tester.widget<NavigationBar>(find.byType(NavigationBar)).selectedIndex,
+      0,
+    );
+
+    await tester.tap(find.text('Tools'));
+    await tester.pumpAndSettle();
+    expect(find.text('NEW NOTE'), findsNothing);
+  });
+
   test('parses pasted scan notes into documented devices', () {
     final devices = parseScanNotes('''
 Living Room TV 192.168.1.40 AA:BB:CC:DD:EE:FF ports 80,443
@@ -55,6 +167,17 @@ Phone 192.168.1.55 ports: 5555,8080
   test('port parser removes duplicates and validates bounds', () {
     expect(parsePorts('443,80,80,8000-8002'), [80, 443, 8000, 8001, 8002]);
     expect(parsePorts('0,65536,nope'), isEmpty);
+  });
+
+  test('DNS lookup failures distinguish missing reverse DNS', () {
+    expect(
+      dnsLookupFailureMessage('192.168.4.30'),
+      contains('No reverse DNS hostname was found for 192.168.4.30'),
+    );
+    expect(
+      dnsLookupFailureMessage('missing-device.local'),
+      contains('Could not resolve “missing-device.local”'),
+    );
   });
 
   test('saved network JSON retains labels, MACs, ports, and notes', () {
@@ -158,28 +281,152 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(saved.ports, [80]);
   });
 
-  test('first LAN scan automatically saves every discovered IP', () {
-    final network = NetworkMap(id: 'new', name: 'New LAN');
-    final added = addFirstScanHosts(network, const [
-      ScannedHost('192.168.1.5', 'printer.local', [80, 443]),
-      ScannedHost('192.168.1.20', '192.168.1.20', [5555]),
-    ]);
+  test('refreshing known ports replaces rather than discovers ports', () {
+    final inventory = LiveInventory()
+      ..observePorts('192.168.1.25', [22, 80, 443]);
 
-    expect(added, 2);
-    expect(network.devices.map((device) => device.ip), [
-      '192.168.1.5',
-      '192.168.1.20',
-    ]);
-    expect(network.devices.first.name, 'printer.local');
-    expect(network.devices.first.ports, [80, 443]);
+    inventory.replacePorts('192.168.1.25', [22, 443]);
 
-    expect(
-      addFirstScanHosts(network, const [
-        ScannedHost('192.168.1.30', 'new.local', [22]),
-      ]),
-      0,
+    expect(inventory.forIp('192.168.1.25')!.ports, [22, 443]);
+  });
+
+  testWidgets('same IP discovered elsewhere does not affect a saved LAN', (
+    tester,
+  ) async {
+    final network = NetworkMap(
+      id: 'lan-a',
+      name: 'LAN A',
+      devices: [
+        DeviceRecord(ip: '192.168.1.25', name: 'LAN A camera', ports: [80]),
+      ],
     );
-    expect(network.devices, hasLength(2));
+    final inventory = LiveInventory()
+      ..observeHost(
+        const ScannedHost('192.168.1.25', 'LAN-B-printer', [443, 9100]),
+      );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: NetworkWorkspace(
+          network: network,
+          liveInventory: inventory,
+          onChanged: () async {},
+        ),
+      ),
+    );
+
+    final tile = tester.widget<DeviceTile>(find.byType(DeviceTile));
+    expect(tile.status, DeviceStatus.saved);
+    expect(network.devices.single.name, 'LAN A camera');
+    expect(network.devices.single.ports, [80]);
+  });
+
+  testWidgets('global findings feed the shared unsaved LAN list', (
+    tester,
+  ) async {
+    final inventory = LiveInventory();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: QuickLanScanPanel(
+            networks: const [],
+            liveInventory: inventory,
+            currentSsid: 'Test WiFi',
+            onOpen: (_) {},
+            onChanged: () async {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byType(DeviceTile), findsNothing);
+    inventory.observePorts('192.168.4.30', [80, 443]);
+    inventory.observeMac('192.168.4.30', 'AA:BB:CC:DD:EE:FF');
+    await tester.pump();
+
+    expect(find.byType(DeviceTile), findsOneWidget);
+    expect(find.text('Web-enabled device'), findsOneWidget);
+    expect(find.text('192.168.4.30'), findsOneWidget);
+    expect(
+      find.byTooltip('Refresh listed ports for 192.168.4.30'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('Web-enabled device'));
+    await tester.pumpAndSettle();
+    expect(find.text('AA:BB:CC:DD:EE:FF'), findsOneWidget);
+    expect(find.text('REFRESH LISTED PORTS / CHECK ALIVE'), findsOneWidget);
+    expect(find.text('PORT SCANNER'), findsOneWidget);
+    await tester.tapAt(const Offset(5, 5));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('SAVE AS NEW'));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<TextField>(find.widgetWithText(TextField, 'Wi-Fi SSID'))
+          .controller!
+          .text,
+      'Test WiFi',
+    );
+    expect(
+      tester
+          .widget<TextField>(find.widgetWithText(TextField, 'Network name *'))
+          .controller!
+          .text,
+      'Test WiFi LAN',
+    );
+    await tester.tap(find.text('CANCEL'));
+    await tester.pumpAndSettle();
+
+    inventory.clear();
+    await tester.pump();
+    expect(find.byType(DeviceTile), findsNothing);
+  });
+
+  test('network merge combines matching devices and preserves originals', () {
+    final first = NetworkMap(
+      id: 'first',
+      name: 'Office',
+      devices: [
+        DeviceRecord(
+          ip: '192.168.1.20',
+          mac: 'AA:BB:CC:DD:EE:FF',
+          name: 'Printer',
+          ports: [80],
+        ),
+      ],
+    );
+    final second = NetworkMap(
+      id: 'second',
+      name: 'Office WiFi',
+      devices: [
+        DeviceRecord(
+          ip: '192.168.1.99',
+          mac: 'AA:BB:CC:DD:EE:FF',
+          ports: [443, 9100],
+        ),
+        DeviceRecord(
+          ip: '192.168.1.20',
+          mac: '11:22:33:44:55:66',
+          name: 'Different device',
+          ports: [22],
+        ),
+      ],
+    );
+
+    final merged = mergeNetworks(first, second);
+
+    expect(merged.devices, hasLength(2));
+    expect(
+      merged.devices
+          .firstWhere((device) => device.mac == 'AA:BB:CC:DD:EE:FF')
+          .ports,
+      [80, 443, 9100],
+    );
+    expect(first.devices.single.ports, [80]);
+    expect(second.devices, hasLength(2));
   });
 
   test('GitHub release parser finds APK and compares versions', () {
@@ -226,6 +473,10 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(find.text('Single port'), findsOneWidget);
     expect(find.text('Common ports'), findsOneWidget);
     expect(find.text('All ports'), findsOneWidget);
+    expect(
+      find.textContaining('${discoveryPorts.length} common ports selected'),
+      findsOneWidget,
+    );
     expect(find.text('Targets'), findsNothing);
 
     await tester.tap(find.text('Single port'));
@@ -237,6 +488,114 @@ Phone 192.168.1.55 ports: 5555,8080
     await tester.pumpAndSettle();
     expect(find.text('192.168.1.5'), findsOneWidget);
     expect(find.text('192.168.1.20'), findsOneWidget);
+  });
+
+  testWidgets('port scan results copy one port or the complete list', (
+    tester,
+  ) async {
+    String? clipboardText;
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        clipboardText =
+            (call.arguments as Map<dynamic, dynamic>)['text'] as String?;
+      }
+      return null;
+    });
+    addTearDown(
+      () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: PortScanResults(
+            results: {
+              '192.168.1.10': [22, 80, 443],
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.longPress(find.text('3 open ports · Hold to copy all'));
+    await tester.pump();
+    expect(clipboardText, '22, 80, 443');
+    expect(find.text('Copied all 3 open ports'), findsOneWidget);
+
+    await tester.tap(find.text('192.168.1.10'));
+    await tester.pumpAndSettle();
+    await tester.longPress(find.text('TCP 80'));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(clipboardText, '80');
+    expect(find.text('Copied port 80'), findsOneWidget);
+  });
+
+  testWidgets('device card long presses copy IP or all information', (
+    tester,
+  ) async {
+    String? clipboardText;
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        clipboardText =
+            (call.arguments as Map<dynamic, dynamic>)['text'] as String?;
+      }
+      return null;
+    });
+    addTearDown(
+      () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: DeviceTile(
+            device: DeviceRecord(
+              ip: '192.168.4.30',
+              mac: 'AA:BB:CC:DD:EE:FF',
+              name: 'Printer',
+              product: 'Likely printer',
+              ports: [80, 9100],
+            ),
+            status: DeviceStatus.active,
+            onTap: () {},
+            onTools: () {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.longPress(find.text('192.168.4.30'));
+    await tester.pump();
+    expect(clipboardText, '192.168.4.30');
+
+    await tester.longPress(find.text('Printer'));
+    await tester.pump();
+    expect(clipboardText, contains('MAC: AA:BB:CC:DD:EE:FF'));
+    expect(clipboardText, contains('Ports: 80, 9100'));
+  });
+
+  testWidgets('saved ports show still-open, new, and closed states', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: PortStatusReview(saved: [22, 80, 445], latest: [22, 443, 445]),
+        ),
+      ),
+    );
+
+    expect(find.text('STILL OPEN'), findsOneWidget);
+    expect(find.text('NEW · NOT SAVED'), findsOneWidget);
+    expect(find.text('NO LONGER OPEN · STILL SAVED'), findsOneWidget);
+    expect(find.text('22'), findsOneWidget);
+    expect(find.text('445'), findsOneWidget);
+    expect(find.text('443'), findsOneWidget);
+    expect(find.text('80'), findsOneWidget);
   });
 
   testWidgets('can create and label a network without framework errors', (
@@ -295,34 +654,177 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('saved network can be deleted after confirmation', (
+  testWidgets(
+    'device details can hand off to rename without lifecycle errors',
+    (tester) async {
+      final device = DeviceRecord(ip: '192.168.1.10', name: 'Old name');
+      var scannedAllPorts = false;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: TextButton(
+                onPressed: () => showDevice(
+                  context,
+                  device,
+                  onRename: () {
+                    showDialog<void>(
+                      context: context,
+                      builder: (dialogContext) => AlertDialog(
+                        title: const Text('Name this device'),
+                        actions: [
+                          FilledButton(
+                            onPressed: () => Navigator.pop(dialogContext),
+                            child: const Text('SAVE'),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                  onEdit: () {},
+                  onScanAllPorts: () => scannedAllPorts = true,
+                  onDelete: () {},
+                ),
+                child: const Text('192.168.1.10'),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('192.168.1.10'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Old name'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Name this device'), findsOneWidget);
+      await tester.tap(find.text('SAVE'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      await tester.tap(find.text('192.168.1.10'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('PORT SCANNER'));
+      await tester.pumpAndSettle();
+      expect(scannedAllPorts, isTrue);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('saved-network hostname findings require approval', (
     tester,
   ) async {
-    final networks = [NetworkMap(id: 'home', name: 'Home LAN')];
+    var approved = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () => showDevice(
+                context,
+                DeviceRecord(ip: '192.168.1.30', name: 'Camera'),
+                fresh: const ScannedHost('192.168.1.30', 'camera.local', []),
+                onScanAllPorts: () {},
+                onApplyHostname: () => approved = true,
+              ),
+              child: const Text('OPEN DEVICE'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('OPEN DEVICE'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('camera.local'), findsOneWidget);
+    await tester.tap(find.text('USE DISCOVERED HOSTNAME'));
+    await tester.pumpAndSettle();
+    expect(approved, isTrue);
+  });
+
+  testWidgets(
+    'saved network can be long-pressed and deleted after confirmation',
+    (tester) async {
+      final networks = [NetworkMap(id: 'home', name: 'Home LAN')];
+      var saved = false;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SavedNetworksList(
+              networks: networks,
+              onOpen: (_) {},
+              onChanged: () async => saved = true,
+            ),
+          ),
+        ),
+      );
+
+      await tester.longPress(find.text('Home LAN'));
+      await tester.pumpAndSettle();
+      expect(find.text('Delete saved network?'), findsOneWidget);
+      await tester.tap(find.text('DELETE'));
+      await tester.pumpAndSettle();
+
+      expect(networks, isEmpty);
+      expect(saved, isTrue);
+      expect(find.text('No networks saved yet.'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('import notes can merge devices into a saved network', (
+    tester,
+  ) async {
+    final networks = [
+      NetworkMap(
+        id: 'home',
+        name: 'Home LAN',
+        devices: [
+          DeviceRecord(
+            ip: '192.168.1.20',
+            mac: 'AA:BB:CC:DD:EE:FF',
+            name: 'Office PC',
+            ports: [22],
+          ),
+        ],
+      ),
+    ];
     var saved = false;
 
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
-          body: SavedNetworksList(
+          body: NetworksPage(
             networks: networks,
+            liveInventory: LiveInventory(),
+            currentSsid: 'Home WiFi',
             onOpen: (_) {},
+            onCreate: () {},
             onChanged: () async => saved = true,
           ),
         ),
       ),
     );
 
-    await tester.drag(find.text('Home LAN'), const Offset(-500, 0));
+    await tester.tap(find.text('IMPORT NOTES'));
     await tester.pumpAndSettle();
-    expect(find.text('Delete saved network?'), findsOneWidget);
-    await tester.tap(find.text('DELETE'));
+    await tester.enterText(
+      find.byType(TextField).last,
+      'Office PC 192.168.1.20 AA:BB:CC:DD:EE:FF ports 22,445',
+    );
+    await tester.tap(find.text('IMPORT DEVICES'));
+    await tester.pumpAndSettle();
+    expect(find.text('Where should these devices go?'), findsOneWidget);
+    await tester.tap(find.text('ADD TO SAVED'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Home LAN').last);
     await tester.pumpAndSettle();
 
-    expect(networks, isEmpty);
+    expect(networks.single.devices.single.ports, [22, 445]);
+    expect(networks.single.notes, contains('Imported scan notes'));
     expect(saved, isTrue);
-    expect(find.text('No networks saved yet.'), findsOneWidget);
-    expect(tester.takeException(), isNull);
   });
 
   testWidgets('import notes closes cleanly and creates a network', (
