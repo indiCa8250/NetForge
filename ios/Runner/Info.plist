@@ -26,6 +26,8 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Take photos to save in the private file workspace.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>NetForge scans your local network to find devices and inspect services you are authorized to test.</string>
 	<key>NSAppTransportSecurity</key>

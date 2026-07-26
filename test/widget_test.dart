@@ -81,6 +81,7 @@ void main() {
     expect(find.text('New note'), findsOneWidget);
     expect(find.text('New folder'), findsOneWidget);
     expect(find.text('Add images'), findsOneWidget);
+    expect(find.text('Take photo'), findsOneWidget);
     await tester.tap(find.text('New note'));
     await tester.pumpAndSettle();
     await tester.enterText(
@@ -126,6 +127,7 @@ void main() {
     await tester.tap(find.text('Private reminder'));
     await tester.pump();
     expect(find.text('2 selected'), findsOneWidget);
+    expect(find.byTooltip('Move selected'), findsOneWidget);
     expect(find.byTooltip('Delete selected'), findsOneWidget);
     await tester.tap(find.byTooltip('Cancel selection'));
     await tester.pump();

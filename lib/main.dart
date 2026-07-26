@@ -6,6 +6,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
+import 'package:image_picker/image_picker.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
@@ -677,6 +678,12 @@ class _SecretNotesPageState extends State<SecretNotesPage> {
       ? null
       : notes.where((entry) => entry.id == currentFolderId).firstOrNull;
 
+  bool get onlyImagesSelected =>
+      selectedEntryIds.isNotEmpty &&
+      notes
+          .where((entry) => selectedEntryIds.contains(entry.id))
+          .every((entry) => entry.kind == 'image');
+
   @override
   void initState() {
     super.initState();
@@ -809,6 +816,11 @@ class _SecretNotesPageState extends State<SecretNotesPage> {
               title: const Text('Add images'),
               onTap: () => Navigator.pop(context, 'images'),
             ),
+            ListTile(
+              leading: const Icon(Icons.camera_alt_outlined),
+              title: const Text('Take photo'),
+              onTap: () => Navigator.pop(context, 'camera'),
+            ),
             const SizedBox(height: 8),
           ],
         ),
@@ -822,6 +834,8 @@ class _SecretNotesPageState extends State<SecretNotesPage> {
         await createFolder();
       case 'images':
         await importImages();
+      case 'camera':
+        await takePhoto();
       case null:
         break;
     }
@@ -865,6 +879,30 @@ class _SecretNotesPageState extends State<SecretNotesPage> {
           body: '',
           kind: 'folder',
           parentId: currentFolderId,
+        ),
+      ),
+    );
+    await save();
+  }
+
+  Future<void> takePhoto() async {
+    final photo = await ImagePicker().pickImage(
+      source: ImageSource.camera,
+      imageQuality: 95,
+    );
+    if (photo == null) return;
+    final path = await copyImageIntoWorkspace(photo);
+    if (!mounted) return;
+    setState(
+      () => notes.add(
+        SecretNote(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          title:
+              'Photo ${DateTime.now().toLocal().toString().split('.').first}',
+          body: '',
+          kind: 'image',
+          parentId: currentFolderId,
+          imagePath: path,
         ),
       ),
     );
@@ -951,6 +989,143 @@ class _SecretNotesPageState extends State<SecretNotesPage> {
         ShareParams(text: '${entry.title}\n\n${entry.body}'),
       );
     }
+  }
+
+  Set<String> descendantIds(Iterable<String> parentIds) {
+    final descendants = <String>{...parentIds};
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (final entry in notes) {
+        if (!descendants.contains(entry.id) &&
+            entry.parentId != null &&
+            descendants.contains(entry.parentId)) {
+          descendants.add(entry.id);
+          changed = true;
+        }
+      }
+    }
+    return descendants;
+  }
+
+  bool hasSelectedAncestor(SecretNote entry) {
+    var parentId = entry.parentId;
+    while (parentId != null) {
+      if (selectedEntryIds.contains(parentId)) return true;
+      parentId = notes
+          .where((item) => item.id == parentId)
+          .firstOrNull
+          ?.parentId;
+    }
+    return false;
+  }
+
+  Future<void> moveSelectedInsideWorkspace() async {
+    if (selectedEntryIds.isEmpty) return;
+    final forbidden = descendantIds(selectedEntryIds);
+    final folders =
+        notes
+            .where(
+              (entry) =>
+                  entry.kind == 'folder' && !forbidden.contains(entry.id),
+            )
+            .toList()
+          ..sort((a, b) => a.title.compareTo(b.title));
+    final destination = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Move selected items to…'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, '__root__'),
+            child: const ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.home_outlined),
+              title: Text('Private files root'),
+            ),
+          ),
+          ...folders.map(
+            (folder) => SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, folder.id),
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.folder_outlined),
+                title: Text(folder.title),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (destination == null || !mounted) return;
+    final newParentId = destination == '__root__' ? null : destination;
+    setState(() {
+      for (final entry in notes.where(
+        (item) =>
+            selectedEntryIds.contains(item.id) && !hasSelectedAncestor(item),
+      )) {
+        entry
+          ..parentId = newParentId
+          ..updatedAt = DateTime.now();
+      }
+      selectedEntryIds.clear();
+    });
+    await save();
+  }
+
+  Future<void> moveSelectedImagesExternal() async {
+    final images = notes
+        .where(
+          (entry) =>
+              selectedEntryIds.contains(entry.id) && entry.kind == 'image',
+        )
+        .toList();
+    if (images.isEmpty || images.length != selectedEntryIds.length) return;
+    final destination = await getDirectoryPath(confirmButtonText: 'MOVE HERE');
+    if (destination == null || !mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Move images out of private files?'),
+        content: Text(
+          'Move ${images.length} ${images.length == 1 ? 'image' : 'images'} '
+          'to the selected phone folder? They will be removed from this private workspace.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('CANCEL'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('MOVE OUT'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    for (var index = 0; index < images.length; index++) {
+      final entry = images[index];
+      final source = File(entry.imagePath);
+      if (!await source.exists()) continue;
+      final extension = entry.imagePath.contains('.')
+          ? '.${entry.imagePath.split('.').last}'
+          : '.jpg';
+      final baseName = entry.title
+          .replaceAll(RegExp(r'\.[^.]+$'), '')
+          .replaceAll(RegExp(r'[^A-Za-z0-9 _-]'), '_');
+      final output =
+          '$destination/${DateTime.now().microsecondsSinceEpoch}_$index'
+          '_${baseName.isEmpty ? 'image' : baseName}$extension';
+      await source.copy(output);
+      await source.delete();
+    }
+    if (!mounted) return;
+    setState(() {
+      notes.removeWhere(images.contains);
+      selectedEntryIds.clear();
+    });
+    await save();
   }
 
   Future<void> openEntry(SecretNote entry) async {
@@ -1170,6 +1345,18 @@ class _SecretNotesPageState extends State<SecretNotesPage> {
               : '${selectedEntryIds.length} selected',
         ),
         actions: [
+          if (selectedEntryIds.isNotEmpty)
+            IconButton(
+              onPressed: moveSelectedInsideWorkspace,
+              tooltip: 'Move selected',
+              icon: const Icon(Icons.drive_file_move_outline),
+            ),
+          if (onlyImagesSelected)
+            IconButton(
+              onPressed: moveSelectedImagesExternal,
+              tooltip: 'Move images to phone folder',
+              icon: const Icon(Icons.outbox_outlined),
+            ),
           if (selectedEntryIds.isNotEmpty)
             IconButton(
               onPressed: deleteSelectedEntries,
