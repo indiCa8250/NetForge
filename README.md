@@ -1,7 +1,6 @@
 # NetForge
 
-NetForge is a local-first Flutter toolkit for mapping and documenting networks
-during authorized assessments.
+NetForge is a local-first Flutter toolkit for mapping and documenting networks on android phones.
 
 ## Features
 
