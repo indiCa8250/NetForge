@@ -1,18 +1,18 @@
 # NetForge
 
-NetForge is a lean Android network field kit for authorized security assessments.
+NetForge is a local-first Flutter toolkit for mapping and documenting networks
+during authorized assessments.
 
-## Working modules
+## Features
 
-- TCP connect port scanner with hostname resolution, bounded concurrency, service labels, and response timing
-- DNS A/AAAA lookup
-- Local IPv4 interface discovery
-- Session activity history
-- Command-kit interface for keyboard-driven workflows
-- Explicit authorization gate and local-only architecture
-
-The scanner uses standard TCP sockets and does not need root. Port ranges are capped at 1,024
-ports per range to keep accidental mobile resource use bounded.
+- Discover devices on the current LAN
+- Save named network inventories with device labels, notes, MAC addresses, and ports
+- Compare later LAN scans with saved devices
+- Scan single, common, or all TCP ports
+- View nearby Wi-Fi access points on Android
+- Perform DNS lookups and subnet calculations
+- Import and export readable network notes
+- Store data locally on the device
 
 ## Run
 
@@ -21,4 +21,14 @@ flutter pub get
 flutter run
 ```
 
-Build an Android APK with `flutter build apk --release`.
+Build an Android APK with:
+
+```sh
+flutter build apk --release
+```
+
+Use NetForge only on networks you own or are authorized to assess.
+
+## License
+
+NetForge is licensed under the GNU General Public License v3.0.
