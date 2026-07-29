@@ -56,6 +56,67 @@ void main() {
     expect(find.text('No networks saved yet.'), findsOneWidget);
   });
 
+  testWidgets(
+    'nearby access point double-tap opens the Android connection handoff',
+    (tester) async {
+      final calls = <MethodCall>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(statusChannel, (call) async {
+            calls.add(call);
+            return switch (call.method) {
+              'requestPermissions' => <String, dynamic>{},
+              'getNearbyAccessPoints' => <Map<String, dynamic>>[
+                {
+                  'ssid': 'Lab WiFi',
+                  'bssid': 'AA:BB:CC:DD:EE:FF',
+                  'level': -48,
+                  'frequency': 5180,
+                  'channel': 36,
+                  'security': 'WPA2-PSK',
+                },
+              ],
+              'connectToAccessPoint' => <String, dynamic>{
+                'status': 'settings_opened',
+                'confirmationRequired': true,
+                'message':
+                    'Android Wi-Fi controls opened. Select Lab WiFi and confirm to connect.',
+              },
+              _ => null,
+            };
+          });
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: NearbyAccessPointsPage(androidPlatformOverride: true),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Lab WiFi'), findsOneWidget);
+      expect(find.byTooltip('Connect to Lab WiFi'), findsOneWidget);
+
+      await tester.tap(find.text('Lab WiFi'));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.text('Lab WiFi'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      final connectCall = calls.singleWhere(
+        (call) => call.method == 'connectToAccessPoint',
+      );
+      expect(connectCall.arguments, {
+        'ssid': 'Lab WiFi',
+        'bssid': 'AA:BB:CC:DD:EE:FF',
+      });
+      expect(
+        find.text(
+          'Android Wi-Fi controls opened. Select Lab WiFi and confirm to connect.',
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
   testWidgets('secret navigation sequence opens notes and close resets it', (
     tester,
   ) async {
@@ -199,6 +260,117 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(merged.hostname, 'printer.local');
     expect(merged.mac, 'AA:BB:CC:DD:EE:FF');
     expect(merged.ports, [22, 443]);
+  });
+
+  test('partial port observations preserve ports that were not checked', () {
+    final saved = DeviceRecord(
+      ip: '192.168.1.20',
+      name: 'Printer',
+      ports: [22, 80, 443],
+    );
+
+    final opened = mergePortScanObservation(
+      const ScannedHost(
+        '192.168.1.20',
+        '192.168.1.20',
+        [5555],
+        checkedPorts: [5555],
+      ),
+      saved: saved,
+    );
+    final closed = mergePortScanObservation(
+      const ScannedHost('192.168.1.20', '192.168.1.20', [], checkedPorts: [80]),
+      previous: opened,
+      saved: saved,
+    );
+
+    expect(opened.ports, [22, 80, 443, 5555]);
+    expect(opened.checkedPorts, [5555]);
+    expect(closed.ports, [22, 443, 5555]);
+    expect(closed.checkedPorts, [80, 5555]);
+  });
+
+  test(
+    'partial port observations preserve saved ports newer than prior results',
+    () {
+      final merged = mergePortScanObservation(
+        const ScannedHost(
+          '192.168.1.20',
+          '192.168.1.20',
+          [22],
+          checkedPorts: [22],
+        ),
+        previous: const ScannedHost(
+          '192.168.1.20',
+          'printer.local',
+          [80],
+          checkedPorts: [80],
+        ),
+        saved: DeviceRecord(
+          ip: '192.168.1.20',
+          name: 'Printer',
+          ports: [80, 443],
+        ),
+      );
+
+      expect(merged.ports, [22, 80, 443]);
+      expect(merged.checkedPorts, [22, 80]);
+    },
+  );
+
+  test('newly observed open ports are added without removing saved ports', () {
+    final originalLastSeen = DateTime.utc(2026, 1, 1);
+    final observedAt = DateTime.utc(2026, 2, 2);
+    final device = DeviceRecord(
+      ip: '192.168.1.20',
+      ports: [80, 443],
+      lastSeen: originalLastSeen,
+    );
+
+    final changed = addObservedOpenPorts(
+      device,
+      const ScannedHost(
+        '192.168.1.20',
+        '192.168.1.20',
+        [443, 5555],
+        checkedPorts: [443, 5555],
+      ),
+      observedAt: observedAt,
+    );
+    final unchanged = addObservedOpenPorts(
+      device,
+      const ScannedHost(
+        '192.168.1.20',
+        '192.168.1.20',
+        [5555],
+        checkedPorts: [5555],
+      ),
+      observedAt: DateTime.utc(2026, 3, 3),
+    );
+
+    expect(changed, isTrue);
+    expect(unchanged, isFalse);
+    expect(device.ports, [80, 443, 5555]);
+    expect(device.lastSeen, observedAt);
+  });
+
+  test('port scan summaries emphasize positive hosts', () {
+    expect(
+      formatPortScanSummary(
+        addressesChecked: 254,
+        checkedPorts: const [5555],
+        hostsWithOpenPorts: 3,
+      ),
+      'TCP 5555 open on 3 of 254 addresses checked.',
+    );
+    expect(
+      formatPortScanSummary(
+        addressesChecked: 1,
+        checkedPorts: const [80, 443],
+        hostsWithOpenPorts: 1,
+      ),
+      '1 of 1 address had at least one selected TCP port open.',
+    );
   });
 
   test('DNS lookup failures distinguish missing reverse DNS', () {
@@ -352,6 +524,115 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(network.devices.single.name, 'LAN A camera');
     expect(network.devices.single.ports, [80]);
   });
+
+  testWidgets(
+    'swiping right checks an inactive device without reviving an unreachable host',
+    (tester) async {
+      final originalLastSeen = DateTime.utc(2026, 1, 2, 3, 4, 5);
+      final device = DeviceRecord(
+        ip: '192.168.1.25',
+        name: 'Offline camera',
+        ports: [80, 443],
+        isDead: true,
+        lastSeen: originalLastSeen,
+      );
+      String? checkedIp;
+      List<int>? checkedPorts;
+      var saveCalls = 0;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: NetworkWorkspace(
+            network: NetworkMap(id: 'lan-a', name: 'LAN A', devices: [device]),
+            liveInventory: LiveInventory(),
+            onChanged: () async => saveCalls++,
+            deviceChecker: (ip, listedPorts) async {
+              checkedIp = ip;
+              checkedPorts = List.of(listedPorts);
+              return DeviceCheckResult(
+                ip: ip,
+                reachable: false,
+                openPorts: const [],
+                checkedPorts: List.of(listedPorts),
+              );
+            },
+          ),
+        ),
+      );
+
+      expect(
+        tester.widget<DeviceTile>(find.byType(DeviceTile)).status,
+        DeviceStatus.dead,
+      );
+      expect(find.text('Red — marked inactive'), findsOneWidget);
+
+      await tester.drag(find.byType(DeviceTile), const Offset(500, 0));
+      await tester.pumpAndSettle();
+
+      expect(checkedIp, device.ip);
+      expect(checkedPorts, [80, 443]);
+      expect(device.isDead, isTrue);
+      expect(device.lastSeen, originalLastSeen);
+      expect(saveCalls, 0);
+      expect(
+        tester.widget<DeviceTile>(find.byType(DeviceTile)).status,
+        DeviceStatus.dead,
+      );
+      expect(find.text('Red — marked inactive'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'saved device popup checks alive, adds reachable ports, and persists',
+    (tester) async {
+      final originalLastSeen = DateTime.utc(2026, 1, 2, 3, 4, 5);
+      final device = DeviceRecord(
+        ip: '192.168.1.25',
+        name: 'Inactive camera',
+        ports: [80, 443],
+        isDead: true,
+        lastSeen: originalLastSeen,
+      );
+      String? checkedIp;
+      List<int>? checkedPorts;
+      var saveCalls = 0;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: NetworkWorkspace(
+            network: NetworkMap(id: 'lan-a', name: 'LAN A', devices: [device]),
+            liveInventory: LiveInventory(),
+            onChanged: () async => saveCalls++,
+            deviceChecker: (ip, listedPorts) async {
+              checkedIp = ip;
+              checkedPorts = List.of(listedPorts);
+              return DeviceCheckResult(
+                ip: ip,
+                reachable: true,
+                openPorts: const [80, 443, 8080],
+                checkedPorts: const [80, 443, 8080],
+              );
+            },
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('Inactive camera'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('REFRESH LISTED PORTS / CHECK ALIVE'), findsOneWidget);
+      await tester.tap(find.text('REFRESH LISTED PORTS / CHECK ALIVE'));
+      await tester.pumpAndSettle();
+
+      expect(checkedIp, device.ip);
+      expect(checkedPorts, [80, 443]);
+      expect(device.isDead, isFalse);
+      expect(device.ports, [80, 443, 8080]);
+      expect(device.lastSeen.isAfter(originalLastSeen), isTrue);
+      expect(saveCalls, 1);
+      expect(find.textContaining('8080'), findsWidgets);
+    },
+  );
 
   testWidgets('global findings feed the shared unsaved LAN list', (
     tester,
@@ -546,9 +827,11 @@ Phone 192.168.1.55 ports: 5555,8080
     expect(find.text('192.168.1.20'), findsOneWidget);
   });
 
-  testWidgets('port scan results copy one port or the complete list', (
+  testWidgets('port results show numbers and retire the copy tip', (
     tester,
   ) async {
+    const copyTip =
+        'Tip: Hold the port list to copy all ports, or hold one port to copy it.';
     String? clipboardText;
     final messenger =
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
@@ -569,23 +852,54 @@ Phone 192.168.1.55 ports: 5555,8080
           body: PortScanResults(
             results: {
               '192.168.1.10': [22, 80, 443],
+              '192.168.1.11': [],
             },
           ),
         ),
       ),
     );
+    await tester.pumpAndSettle();
 
-    await tester.longPress(find.text('3 open ports · Hold to copy all'));
-    await tester.pump();
+    expect(find.text(copyTip), findsOneWidget);
+    expect(find.text('22, 80, 443'), findsOneWidget);
+    expect(find.text('3 open ports · Hold to copy all'), findsNothing);
+    expect(find.text('192.168.1.11'), findsNothing);
+
+    await tester.longPress(find.text('22, 80, 443'));
+    await tester.pumpAndSettle();
     expect(clipboardText, '22, 80, 443');
     expect(find.text('Copied all 3 open ports'), findsOneWidget);
+    expect(find.text(copyTip), findsNothing);
+    expect(
+      (await SharedPreferences.getInstance()).getBool(
+        portScanCopyTipPreferenceKey,
+      ),
+      isTrue,
+    );
 
     await tester.tap(find.text('192.168.1.10'));
     await tester.pumpAndSettle();
-    await tester.longPress(find.text('TCP 80'));
-    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('SSH'), findsNothing);
+    expect(find.text('HTTP'), findsNothing);
+    await tester.longPress(find.text('80'));
+    await tester.pumpAndSettle();
     expect(clipboardText, '80');
     expect(find.text('Copied port 80'), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        key: UniqueKey(),
+        home: const Scaffold(
+          body: PortScanResults(
+            results: {
+              '192.168.1.10': [22, 80, 443],
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text(copyTip), findsNothing);
   });
 
   testWidgets('device card long presses copy IP or all information', (

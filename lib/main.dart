@@ -593,23 +593,67 @@ class _MapperShellState extends State<MapperShell> {
         onChanged: save,
       ),
     ];
-    return Scaffold(
-      body: IndexedStack(index: tab, children: pages),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: tab,
-        onDestinationSelected: selectMainDestination,
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.home_rounded), label: 'Home'),
-          NavigationDestination(
-            icon: Icon(Icons.construction_rounded),
-            label: 'Tools',
+    // Keep one feature set, but give wide screens a desktop-appropriate
+    // navigation pattern. This applies naturally to Linux and tablets without
+    // creating a second application to maintain.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // A 900 px breakpoint keeps the compact layout useful in narrow
+        // desktop windows while moving typical Linux desktop windows to the
+        // rail navigation.
+        final useNavigationRail = constraints.maxWidth >= 900;
+        final content = IndexedStack(index: tab, children: pages);
+        if (useNavigationRail) {
+          return Scaffold(
+            body: Row(
+              children: [
+                NavigationRail(
+                  selectedIndex: tab,
+                  onDestinationSelected: selectMainDestination,
+                  labelType: NavigationRailLabelType.all,
+                  destinations: const [
+                    NavigationRailDestination(
+                      icon: Icon(Icons.home_rounded),
+                      label: Text('Home'),
+                    ),
+                    NavigationRailDestination(
+                      icon: Icon(Icons.construction_rounded),
+                      label: Text('Tools'),
+                    ),
+                    NavigationRailDestination(
+                      icon: Icon(Icons.hub_rounded),
+                      label: Text('Networks'),
+                    ),
+                  ],
+                ),
+                const VerticalDivider(width: 1, color: border),
+                Expanded(child: content),
+              ],
+            ),
+          );
+        }
+        return Scaffold(
+          body: content,
+          bottomNavigationBar: NavigationBar(
+            selectedIndex: tab,
+            onDestinationSelected: selectMainDestination,
+            destinations: const [
+              NavigationDestination(
+                icon: Icon(Icons.home_rounded),
+                label: 'Home',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.construction_rounded),
+                label: 'Tools',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.hub_rounded),
+                label: 'Networks',
+              ),
+            ],
           ),
-          NavigationDestination(
-            icon: Icon(Icons.hub_rounded),
-            label: 'Networks',
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -2402,27 +2446,20 @@ class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
   }
 
   Future<void> checkResultAlive(ScannedHost host) async {
-    final checks = await Future.wait(
-      host.ports.map(
-        (port) async => (port: port, probe: await _probe(host.ip, port)),
-      ),
-    );
-    final openPorts = [
-      for (final check in checks)
-        if (check.probe.open) check.port,
-    ];
-    final respondedOnListedPort = checks.any((check) => check.probe.reachable);
-    final alive = respondedOnListedPort || await pingHost(host.ip);
-    widget.liveInventory.replacePorts(host.ip, openPorts);
-    final mac = (await discoverNeighborMacs())[host.ip];
-    if (mac != null) widget.liveInventory.observeMac(host.ip, mac);
+    final result = await checkHostAndListedPorts(host.ip, host.ports);
+    if (result.reachable) {
+      widget.liveInventory.replacePorts(host.ip, result.openPorts);
+      if (result.mac.isNotEmpty) {
+        widget.liveInventory.observeMac(host.ip, result.mac);
+      }
+    }
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          alive
-              ? '${host.ip} is alive · ${openPorts.length} of '
-                    '${host.ports.length} listed ports still open.'
+          result.reachable
+              ? '${host.ip} is alive · ${result.openPorts.length} checked '
+                    'ports are open.'
               : '${host.ip} did not respond. It may be offline or blocking ping.',
         ),
       ),
@@ -2566,17 +2603,45 @@ class _QuickLanScanPanelState extends State<QuickLanScanPanel> {
   );
 }
 
+class DeviceCheckResult {
+  const DeviceCheckResult({
+    required this.ip,
+    required this.reachable,
+    required this.openPorts,
+    required this.checkedPorts,
+    this.mac = '',
+  });
+
+  final String ip;
+  final bool reachable;
+  final List<int> openPorts;
+  final List<int> checkedPorts;
+  final String mac;
+}
+
+typedef DeviceChecker =
+    Future<DeviceCheckResult> Function(String ip, List<int> listedPorts);
+
+typedef LanScanner =
+    Future<List<ScannedHost>> Function({
+      void Function(int checked)? onProgress,
+    });
+
 class NetworkWorkspace extends StatefulWidget {
   const NetworkWorkspace({
     super.key,
     required this.network,
     required this.onChanged,
     required this.liveInventory,
+    this.deviceChecker,
+    this.lanScanner,
   });
 
   final NetworkMap network;
   final Future<void> Function() onChanged;
   final LiveInventory liveInventory;
+  final DeviceChecker? deviceChecker;
+  final LanScanner? lanScanner;
 
   @override
   State<NetworkWorkspace> createState() => _NetworkWorkspaceState();
@@ -2588,6 +2653,8 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
   final refreshed = <String, ScannedHost>{};
   final missing = <String>{};
   final ignored = <String>{};
+  final checking = <String>{};
+  final recentlyAddedPorts = <String, Set<int>>{};
   bool scanning = false;
   bool hasRefreshed = false;
   int checked = 0;
@@ -2614,9 +2681,10 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
       refreshed.clear();
       missing.clear();
       ignored.clear();
+      recentlyAddedPorts.clear();
     });
     try {
-      final hosts = await discoverLan(
+      final hosts = await (widget.lanScanner ?? discoverLan)(
         onProgress: (value) {
           if (mounted && (value % 8 == 0 || value == 254)) {
             setState(() => checked = value);
@@ -2625,9 +2693,60 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
       );
       if (!mounted) return;
       final byIp = {for (final host in hosts) host.ip: host};
+      final savedChecks = await Future.wait(
+        widget.network.devices.map((device) async {
+          try {
+            final result =
+                await (widget.deviceChecker ?? checkHostAndListedPorts)(
+                  device.ip,
+                  List.of(device.ports),
+                );
+            return (device: device, result: result);
+          } catch (_) {
+            return (device: device, result: null);
+          }
+        }),
+      );
+      if (!mounted) return;
+      for (final entry in savedChecks) {
+        final result = entry.result;
+        if (result == null) continue;
+        final broadResult = byIp[entry.device.ip];
+        if (!result.reachable && broadResult == null) continue;
+        final ports = {...?broadResult?.ports, ...result.openPorts}.toList()
+          ..sort();
+        final checkedPorts = {
+          ...?broadResult?.checkedPorts,
+          ...result.checkedPorts,
+        }.toList()..sort();
+        final hostname = broadResult?.hostname.isNotEmpty == true
+            ? broadResult!.hostname
+            : entry.device.name.isNotEmpty
+            ? entry.device.name
+            : entry.device.ip;
+        byIp[entry.device.ip] = ScannedHost(
+          entry.device.ip,
+          hostname,
+          ports,
+          mac: result.mac.isNotEmpty ? result.mac : broadResult?.mac ?? '',
+          checkedPorts: checkedPorts,
+        );
+      }
       final savedIps = widget.network.devices
           .map((device) => device.ip)
           .toSet();
+      final observedAt = DateTime.now();
+      var touchedSavedDevice = false;
+      for (final device in widget.network.devices) {
+        final observation = byIp[device.ip];
+        if (observation == null) continue;
+        final before = device.ports.toSet();
+        addObservedOpenPorts(device, observation, observedAt: observedAt);
+        final added = device.ports.toSet().difference(before);
+        if (added.isNotEmpty) recentlyAddedPorts[device.ip] = added;
+        device.lastSeen = observedAt;
+        touchedSavedDevice = true;
+      }
       setState(() {
         refreshed.addAll(byIp);
         missing.addAll(savedIps.difference(byIp.keys.toSet()));
@@ -2635,6 +2754,7 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
         scanning = false;
         hasRefreshed = true;
       });
+      if (touchedSavedDevice) await changed();
     } catch (error) {
       if (!mounted) return;
       setState(() => scanning = false);
@@ -2692,26 +2812,81 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
     await changed();
   }
 
-  Future<void> markDeviceActive(DeviceRecord device) async {
-    final latest = refreshed[device.ip];
-    device
-      ..isDead = false
-      ..lastSeen = DateTime.now();
-    missing.remove(device.ip);
-    refreshed[device.ip] = ScannedHost(
-      device.ip,
-      latest?.hostname ?? device.name,
-      latest == null ? List.of(device.ports) : List.of(latest.ports),
-      mac: latest?.mac ?? device.mac,
-    );
-    await changed();
-  }
+  Future<void> checkSavedDevice(DeviceRecord device) async {
+    if (checking.contains(device.ip)) return;
+    setState(() => checking.add(device.ip));
+    try {
+      final result = await (widget.deviceChecker ?? checkHostAndListedPorts)(
+        device.ip,
+        List.of(device.ports),
+      );
+      if (!mounted) return;
+      if (!result.reachable) {
+        setState(() {
+          refreshed.remove(device.ip);
+          missing.add(device.ip);
+          recentlyAddedPorts.remove(device.ip);
+          hasRefreshed = true;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${device.ip} did not respond to ping or its listed ports.',
+            ),
+          ),
+        );
+        return;
+      }
 
-  Future<void> restoreDeviceNormal(DeviceRecord device) async {
-    device.isDead = false;
-    missing.remove(device.ip);
-    refreshed.remove(device.ip);
-    await changed();
+      final previous = refreshed[device.ip];
+      final hostname = previous?.hostname.isNotEmpty == true
+          ? previous!.hostname
+          : device.name.isNotEmpty
+          ? device.name
+          : device.ip;
+      final observed = ScannedHost(
+        device.ip,
+        hostname,
+        List.of(result.openPorts),
+        mac: result.mac.isNotEmpty ? result.mac : previous?.mac ?? '',
+        checkedPorts: List.of(result.checkedPorts),
+      );
+      final observedAt = DateTime.now();
+      final before = device.ports.toSet();
+      addObservedOpenPorts(device, observed, observedAt: observedAt);
+      final added = device.ports.toSet().difference(before);
+      device
+        ..isDead = false
+        ..lastSeen = observedAt;
+      setState(() {
+        refreshed[device.ip] = observed;
+        missing.remove(device.ip);
+        if (added.isEmpty) {
+          recentlyAddedPorts.remove(device.ip);
+        } else {
+          recentlyAddedPorts[device.ip] = added;
+        }
+        hasRefreshed = true;
+      });
+      await changed();
+      if (!mounted) return;
+      final openText = result.openPorts.isEmpty
+          ? 'No checked ports are open, but the IP responded.'
+          : 'Open ports: ${result.openPorts.join(', ')}.';
+      final addedText = added.isEmpty
+          ? ''
+          : ' Added automatically: ${(added.toList()..sort()).join(', ')}.';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${device.ip} is active. $openText$addedText')),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Check failed: $error')));
+    } finally {
+      if (mounted) setState(() => checking.remove(device.ip));
+    }
   }
 
   Future<void> openDeviceTools(DeviceRecord device) async {
@@ -2737,7 +2912,8 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
               ),
               const SizedBox(height: 4),
               const Text(
-                'Choose a tool. Detected changes stay pending until you approve them.',
+                'Choose a tool. Newly confirmed open ports are saved '
+                'automatically; identity and removals remain reviewable.',
                 style: TextStyle(color: secondary),
               ),
               const SizedBox(height: 12),
@@ -2808,16 +2984,29 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
           initialPortMode: scanAllPorts
               ? PortSelectionMode.all
               : PortSelectionMode.common,
-          onResults: (result) {
+          onResults: (result) async {
             if (!mounted) return;
+            final observedAt = DateTime.now();
+            final before = device.ports.toSet();
+            addObservedOpenPorts(device, result, observedAt: observedAt);
+            final added = device.ports.toSet().difference(before);
+            device.lastSeen = observedAt;
+            final merged = mergePortScanObservation(
+              result,
+              previous: refreshed[device.ip],
+              saved: device,
+            );
             setState(() {
-              refreshed[device.ip] = mergePortScanObservation(
-                result,
-                previous: refreshed[device.ip],
-                saved: device,
-              );
+              refreshed[device.ip] = merged;
               missing.remove(device.ip);
+              if (added.isEmpty) {
+                recentlyAddedPorts.remove(device.ip);
+              } else {
+                recentlyAddedPorts[device.ip] = added;
+              }
+              hasRefreshed = true;
             });
+            await changed();
           },
         ),
       ),
@@ -2849,9 +3038,20 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                 child: SingleChildScrollView(child: SelectableText(readable)),
               ),
               const SizedBox(height: 12),
+              if (Platform.isAndroid) ...[
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: () => shareNetForgeFile(fileName, json),
+                    icon: const Icon(Icons.share_rounded),
+                    label: const Text('SHARE .NETFORGE FILE'),
+                  ),
+                ),
+                const SizedBox(height: 10),
+              ],
               SizedBox(
                 width: double.infinity,
-                child: FilledButton.icon(
+                child: OutlinedButton.icon(
                   onPressed: () async {
                     final saved = await saveNetForgeFile(fileName, json);
                     if (!saved || !context.mounted) return;
@@ -2894,6 +3094,24 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
     );
   }
 
+  Future<void> shareNetForgeFile(String fileName, String content) async {
+    try {
+      final file = XFile.fromData(
+        Uint8List.fromList(utf8.encode(content)),
+        mimeType: 'application/json',
+        name: fileName,
+      );
+      await SharePlus.instance.share(
+        ShareParams(files: [file], title: 'Share ${widget.network.name}'),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open the share sheet.')),
+      );
+    }
+  }
+
   Future<bool> saveNetForgeFile(String fileName, String content) async {
     if (Platform.isAndroid) {
       return await deviceChannel.invokeMethod<bool>('saveNetForgeFile', {
@@ -2934,7 +3152,7 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
         actions: [
           IconButton(
             onPressed: exportNetwork,
-            tooltip: 'Export',
+            tooltip: 'Export or share network',
             icon: const Icon(Icons.ios_share_rounded),
           ),
           IconButton(
@@ -3017,9 +3235,9 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                 color: accent,
                 title: '${device.title} · ${device.ip}',
                 subtitle: 'Currently live, but marked inactive in your list.',
-                primary: 'MARK ACTIVE',
+                primary: 'CHECK & MARK ACTIVE',
                 secondary: 'EDIT',
-                onPrimary: () => markDeviceActive(device),
+                onPrimary: () => checkSavedDevice(device),
                 onSecondary: () => editDevice(device),
               ),
             ),
@@ -3072,8 +3290,13 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
             ...widget.network.devices.map((device) {
               final isMissing = missing.contains(device.ip);
               final fresh = refreshed[device.ip];
+              final addedPorts = recentlyAddedPorts[device.ip] ?? const <int>{};
+              final closedPorts = observedClosedPorts(device, fresh);
+              final unsavedOpenPorts = observedUnsavedOpenPorts(device, fresh);
               final portsChanged =
-                  fresh != null && !samePorts(device.ports, fresh.ports);
+                  addedPorts.isNotEmpty ||
+                  closedPorts.isNotEmpty ||
+                  unsavedOpenPorts.isNotEmpty;
               final macChanged =
                   fresh != null &&
                   isUsableMacAddress(fresh.mac) &&
@@ -3088,6 +3311,13 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                   : fresh != null
                   ? DeviceStatus.active
                   : DeviceStatus.saved;
+              final statusReason = deviceStatusReason(
+                status: status,
+                device: device,
+                fresh: fresh,
+                automaticallyAddedPorts: addedPorts,
+                checking: checking.contains(device.ip),
+              );
               return Dismissible(
                 key: ValueKey(
                   '${widget.network.id}:${device.ip}:${device.mac}',
@@ -3096,10 +3326,8 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                 background: _SwipeStatusBackground(
                   alignment: Alignment.centerLeft,
                   color: accent,
-                  icon: device.isDead
-                      ? Icons.undo_rounded
-                      : Icons.refresh_rounded,
-                  label: device.isDead ? 'RESTORE NORMAL' : 'REFRESH ACTIVE',
+                  icon: Icons.network_ping_rounded,
+                  label: 'CHECK IP & PORTS',
                 ),
                 secondaryBackground: _SwipeStatusBackground(
                   alignment: Alignment.centerRight,
@@ -3114,11 +3342,7 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                     if (device.isDead) return true;
                     device.isDead = true;
                   } else if (direction == DismissDirection.startToEnd) {
-                    if (device.isDead) {
-                      await restoreDeviceNormal(device);
-                    } else {
-                      await markDeviceActive(device);
-                    }
+                    await checkSavedDevice(device);
                     return false;
                   }
                   await changed();
@@ -3135,26 +3359,19 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                   device: device,
                   observedMac: fresh?.mac ?? '',
                   status: status,
+                  statusReason: statusReason,
                   onTools: () => openDeviceTools(device),
+                  onPing: checking.contains(device.ip)
+                      ? null
+                      : () => checkSavedDevice(device),
                   onTap: () => showDevice(
                     context,
                     device,
                     fresh: fresh,
                     onRename: () => renameDevice(device),
                     onEdit: () => editDevice(device),
+                    onPing: () => checkSavedDevice(device),
                     onScanAllPorts: () => openDevicePortScanner(device),
-                    onAddNewPorts: fresh == null
-                        ? null
-                        : () async {
-                            final mergedPorts = {
-                              ...device.ports,
-                              ...fresh.ports,
-                            }.toList()..sort();
-                            device
-                              ..ports = mergedPorts
-                              ..lastSeen = DateTime.now();
-                            await changed();
-                          },
                     onApplyMac: !macChanged
                         ? null
                         : () async {
@@ -3192,14 +3409,18 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
                         ? null
                         : () async {
                             device
-                              ..ports = List.of(fresh.ports)
+                              ..ports =
+                                  (device.ports
+                                      .where(
+                                        (port) => !closedPorts.contains(port),
+                                      )
+                                      .toList()
+                                    ..sort())
                               ..lastSeen = DateTime.now();
                             await changed();
                           },
                   ),
-                  onKeep: isMissing
-                      ? () => setState(() => missing.remove(device.ip))
-                      : null,
+                  onKeep: isMissing ? () => checkSavedDevice(device) : null,
                   onDelete: isMissing
                       ? () async {
                           widget.network.devices.remove(device);
@@ -3275,6 +3496,63 @@ class _NetworkWorkspaceState extends State<NetworkWorkspace> {
 }
 
 enum DeviceStatus { saved, active, changed, missing, dead }
+
+Set<int> _checkedPortsFor(DeviceRecord device, ScannedHost fresh) {
+  if (fresh.checkedPorts.isNotEmpty) return fresh.checkedPorts.toSet();
+  // Empty coverage is the legacy full-snapshot form of ScannedHost.
+  return {...device.ports, ...fresh.ports};
+}
+
+List<int> observedClosedPorts(DeviceRecord device, ScannedHost? fresh) {
+  if (fresh == null) return const [];
+  final closed = device.ports.toSet().intersection(
+    _checkedPortsFor(device, fresh),
+  )..removeAll(fresh.ports);
+  return closed.toList()..sort();
+}
+
+List<int> observedUnsavedOpenPorts(DeviceRecord device, ScannedHost? fresh) {
+  if (fresh == null) return const [];
+  final unsaved = fresh.ports.toSet()..removeAll(device.ports);
+  return unsaved.toList()..sort();
+}
+
+String deviceStatusReason({
+  required DeviceStatus status,
+  required DeviceRecord device,
+  ScannedHost? fresh,
+  Iterable<int> automaticallyAddedPorts = const [],
+  bool checking = false,
+}) {
+  if (checking) return 'Checking IP and listed ports…';
+  if (status == DeviceStatus.dead) return 'Red — marked inactive';
+  if (status == DeviceStatus.missing) {
+    return 'Red — no response to ping or listed-port checks';
+  }
+  if (status != DeviceStatus.changed) return '';
+
+  final reasons = <String>[];
+  final added = automaticallyAddedPorts.toSet().toList()..sort();
+  if (added.isNotEmpty) {
+    reasons.add('new open ports added: ${added.join(', ')}');
+  }
+  final unsaved = observedUnsavedOpenPorts(device, fresh);
+  if (unsaved.isNotEmpty) {
+    reasons.add('new open ports found: ${unsaved.join(', ')}');
+  }
+  final closed = observedClosedPorts(device, fresh);
+  if (closed.isNotEmpty) {
+    reasons.add('listed ports not open: ${closed.join(', ')}');
+  }
+  if (fresh != null &&
+      isUsableMacAddress(fresh.mac) &&
+      normalizeMacAddress(fresh.mac) != normalizeMacAddress(device.mac)) {
+    reasons.add('MAC address changed');
+  }
+  return reasons.isEmpty
+      ? 'Yellow — observed details changed'
+      : 'Yellow — ${reasons.join(' · ')}';
+}
 
 String macDiscoveryExplanation() {
   if (Platform.isAndroid) {
@@ -3367,6 +3645,7 @@ class DeviceTile extends StatelessWidget {
     required this.onTap,
     required this.onTools,
     this.observedMac = '',
+    this.statusReason = '',
     this.onPing,
     this.onKeep,
     this.onDelete,
@@ -3377,6 +3656,7 @@ class DeviceTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onTools;
   final String observedMac;
+  final String statusReason;
   final VoidCallback? onPing;
   final VoidCallback? onKeep;
   final VoidCallback? onDelete;
@@ -3465,6 +3745,17 @@ class DeviceTile extends StatelessWidget {
                         fontFamily: 'monospace',
                       ),
                     ),
+                  if (statusReason.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      statusReason,
+                      style: TextStyle(
+                        color: color,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
                 ],
               ),
               trailing: Row(
@@ -3488,7 +3779,7 @@ class DeviceTile extends StatelessWidget {
                     Expanded(
                       child: OutlinedButton(
                         onPressed: onKeep,
-                        child: const Text('KEEP'),
+                        child: const Text('CHECK AGAIN'),
                       ),
                     ),
                     const SizedBox(width: 8),
@@ -3950,7 +4241,9 @@ class NearbyAccessPoint {
 }
 
 class NearbyAccessPointsPage extends StatefulWidget {
-  const NearbyAccessPointsPage({super.key});
+  const NearbyAccessPointsPage({super.key, this.androidPlatformOverride});
+
+  final bool? androidPlatformOverride;
 
   @override
   State<NearbyAccessPointsPage> createState() => _NearbyAccessPointsPageState();
@@ -3962,6 +4255,9 @@ class _NearbyAccessPointsPageState extends State<NearbyAccessPointsPage> {
   List<NearbyAccessPoint> accessPoints = [];
   bool loading = true;
   String? error;
+  String? connectingAccessPoint;
+
+  bool get isAndroid => widget.androidPlatformOverride ?? Platform.isAndroid;
 
   @override
   void initState() {
@@ -3975,7 +4271,7 @@ class _NearbyAccessPointsPageState extends State<NearbyAccessPointsPage> {
       error = null;
     });
     try {
-      if (!Platform.isAndroid) {
+      if (!isAndroid) {
         throw PlatformException(
           code: 'unsupported',
           message:
@@ -4000,6 +4296,32 @@ class _NearbyAccessPointsPageState extends State<NearbyAccessPointsPage> {
         loading = false;
       });
     }
+  }
+
+  Future<void> connect(NearbyAccessPoint accessPoint) async {
+    final connectionKey = '${accessPoint.ssid}|${accessPoint.bssid}';
+    if (connectingAccessPoint != null) return;
+    setState(() => connectingAccessPoint = connectionKey);
+    var message = 'Could not open Android Wi-Fi controls.';
+    try {
+      final response =
+          await channel.invokeMapMethod<Object?, Object?>(
+            'connectToAccessPoint',
+            {'ssid': accessPoint.ssid, 'bssid': accessPoint.bssid},
+          ) ??
+          const <Object?, Object?>{};
+      message =
+          response['message'] as String? ??
+          'Android Wi-Fi controls opened. Confirm the connection there.';
+    } on PlatformException catch (exception) {
+      message = exception.message ?? message;
+    } finally {
+      if (mounted) setState(() => connectingAccessPoint = null);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   IconData signalIcon(int level) {
@@ -4030,7 +4352,8 @@ class _NearbyAccessPointsPageState extends State<NearbyAccessPointsPage> {
         ),
         const SizedBox(height: 4),
         const Text(
-          'Access points are ordered by signal strength.',
+          'Access points are ordered by signal strength. Double-tap a named '
+          'network or use its connect button to open Android Wi-Fi controls.',
           style: TextStyle(color: secondary),
         ),
         if (loading) ...[
@@ -4064,35 +4387,60 @@ class _NearbyAccessPointsPageState extends State<NearbyAccessPointsPage> {
             ),
           ),
           const SizedBox(height: 8),
-          ...accessPoints.map(
-            (accessPoint) => Card(
+          ...accessPoints.map((accessPoint) {
+            final connectionKey = '${accessPoint.ssid}|${accessPoint.bssid}';
+            final connecting = connectingAccessPoint == connectionKey;
+            final canConnect =
+                accessPoint.ssid.isNotEmpty && connectingAccessPoint == null;
+            return Card(
               color: surface,
+              clipBehavior: Clip.antiAlias,
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(14),
                 side: const BorderSide(color: border),
               ),
-              child: ListTile(
-                leading: Icon(signalIcon(accessPoint.level), color: accent),
-                title: Text(
-                  accessPoint.ssid.isEmpty
-                      ? 'Hidden network'
-                      : accessPoint.ssid,
-                  style: const TextStyle(fontWeight: FontWeight.w800),
-                ),
-                subtitle: Text(
-                  [
-                    accessPoint.bssid,
-                    '${accessPoint.level} dBm',
-                    if (accessPoint.channel > 0) 'Ch ${accessPoint.channel}',
-                    if (accessPoint.frequency > 0)
-                      '${accessPoint.frequency} MHz',
-                    if (accessPoint.security.isNotEmpty) accessPoint.security,
-                  ].join(' · '),
-                  style: const TextStyle(color: secondary, fontSize: 12),
+              child: InkWell(
+                onDoubleTap: canConnect ? () => connect(accessPoint) : null,
+                child: ListTile(
+                  leading: Icon(signalIcon(accessPoint.level), color: accent),
+                  title: Text(
+                    accessPoint.ssid.isEmpty
+                        ? 'Hidden network'
+                        : accessPoint.ssid,
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: Text(
+                    [
+                      'BSSID ${accessPoint.bssid}',
+                      '${accessPoint.level} dBm',
+                      if (accessPoint.channel > 0) 'Ch ${accessPoint.channel}',
+                      if (accessPoint.frequency > 0)
+                        '${accessPoint.frequency} MHz',
+                      if (accessPoint.security.isNotEmpty) accessPoint.security,
+                    ].join(' · '),
+                    style: const TextStyle(color: secondary, fontSize: 12),
+                  ),
+                  trailing: connecting
+                      ? const SizedBox.square(
+                          dimension: 22,
+                          child: CircularProgressIndicator(
+                            color: accent,
+                            strokeWidth: 2,
+                          ),
+                        )
+                      : IconButton(
+                          onPressed: canConnect
+                              ? () => connect(accessPoint)
+                              : null,
+                          tooltip: accessPoint.ssid.isEmpty
+                              ? 'Hidden networks require Android Wi-Fi settings'
+                              : 'Connect to ${accessPoint.ssid}',
+                          icon: const Icon(Icons.login_rounded),
+                        ),
                 ),
               ),
-            ),
-          ),
+            );
+          }),
         ],
       ],
     ),
@@ -4122,16 +4470,32 @@ class SimplePortScanner extends StatefulWidget {
 
 enum PortSelectionMode { common, custom, all }
 
+String formatPortScanSummary({
+  required int addressesChecked,
+  required List<int> checkedPorts,
+  required int hostsWithOpenPorts,
+}) {
+  final addressLabel = addressesChecked == 1 ? 'address' : 'addresses';
+  if (checkedPorts.length == 1) {
+    return 'TCP ${checkedPorts.single} open on $hostsWithOpenPorts of '
+        '$addressesChecked $addressLabel checked.';
+  }
+  return '$hostsWithOpenPorts of $addressesChecked $addressLabel had at least '
+      'one selected TCP port open.';
+}
+
 class _SimplePortScannerState extends State<SimplePortScanner> {
   static const scanLanTarget = '__scan_lan__';
 
   final ports = TextEditingController();
   final results = <String, List<int>>{};
+  List<int> lastScannedPorts = const [];
   late String selectedTarget;
   late PortSelectionMode portMode;
   bool scanning = false;
   int checked = 0;
   int total = 0;
+  int targetsChecked = 0;
 
   @override
   void initState() {
@@ -4190,6 +4554,8 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
       scanning = true;
       checked = 0;
       total = 0;
+      targetsChecked = 0;
+      lastScannedPorts = List.unmodifiable(scanPorts);
       results.clear();
     });
     try {
@@ -4217,17 +4583,25 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
           if (mounted) {
             setState(() {
               checked += batch.length;
-              if (reachable) {
+              if (open.isNotEmpty) {
                 results[address] = List.of(open)..sort();
               }
             });
           }
         }
+        if (mounted) setState(() => targetsChecked++);
         if (reachable) {
-          if (widget.recordInLiveInventory) {
+          if (widget.recordInLiveInventory && open.isNotEmpty) {
             widget.liveInventory.observePorts(address, open);
           }
-          widget.onResults?.call(ScannedHost(address, address, List.of(open)));
+          widget.onResults?.call(
+            ScannedHost(
+              address,
+              address,
+              List.of(open),
+              checkedPorts: List.of(scanPorts),
+            ),
+          );
         }
       }
     } catch (error) {
@@ -4339,6 +4713,20 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
             ),
           ],
           const SizedBox(height: 18),
+          if (!scanning && targetsChecked > 0) ...[
+            Text(
+              formatPortScanSummary(
+                addressesChecked: targetsChecked,
+                checkedPorts: lastScannedPorts,
+                hostsWithOpenPorts: results.length,
+              ),
+              style: TextStyle(
+                color: results.isEmpty ? secondary : accent,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
           PortScanResults(results: results),
           if (!scanning && checked > 0 && results.isEmpty)
             const EmptyMessage(
@@ -4367,27 +4755,89 @@ class _SimplePortScannerState extends State<SimplePortScanner> {
   }
 }
 
-class PortScanResults extends StatelessWidget {
+const portScanCopyTipPreferenceKey = 'netforge.port_scan.copy_tip_completed';
+
+class PortScanResults extends StatefulWidget {
   const PortScanResults({super.key, required this.results});
 
   final Map<String, List<int>> results;
 
-  Future<void> copy(BuildContext context, String text, String message) async {
+  @override
+  State<PortScanResults> createState() => _PortScanResultsState();
+}
+
+class _PortScanResultsState extends State<PortScanResults> {
+  bool showCopyTip = false;
+
+  @override
+  void initState() {
+    super.initState();
+    loadCopyTip();
+  }
+
+  Future<void> loadCopyTip() async {
+    final preferences = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      showCopyTip = preferences.getBool(portScanCopyTipPreferenceKey) != true;
+    });
+  }
+
+  Future<void> copy(String text, String message) async {
     await Clipboard.setData(ClipboardData(text: text));
-    if (!context.mounted) return;
+    if (mounted && showCopyTip) setState(() => showCopyTip = false);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool(portScanCopyTipPreferenceKey, true);
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
-  Widget build(BuildContext context) => Column(
-    children: results.entries
-        .map(
+  Widget build(BuildContext context) {
+    final entries =
+        widget.results.entries
+            .where((entry) => entry.value.isNotEmpty)
+            .map(
+              (entry) =>
+                  (ip: entry.key, ports: entry.value.toSet().toList()..sort()),
+            )
+            .toList()
+          ..sort((left, right) => compareIpv4(left.ip, right.ip));
+    return Column(
+      children: [
+        if (showCopyTip && entries.isNotEmpty)
+          Container(
+            key: const ValueKey('port-scan-copy-tip'),
+            width: double.infinity,
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: accent.withValues(alpha: .08),
+              border: Border.all(color: accent.withValues(alpha: .45)),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.lightbulb_outline_rounded, color: accent, size: 18),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Tip: Hold the port list to copy all ports, or hold one '
+                    'port to copy it.',
+                    style: TextStyle(color: secondary, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ...entries.map(
           (entry) => ExpansionTile(
             leading: const Icon(Icons.check_circle_rounded, color: accent),
             title: Text(
-              entry.key,
+              entry.ip,
               style: const TextStyle(
                 fontFamily: 'monospace',
                 fontWeight: FontWeight.w900,
@@ -4396,39 +4846,48 @@ class PortScanResults extends StatelessWidget {
             subtitle: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onLongPress: () => copy(
-                context,
-                entry.value.join(', '),
-                'Copied all ${entry.value.length} open ports',
+                entry.ports.join(', '),
+                'Copied all ${entry.ports.length} open ports',
               ),
               child: Padding(
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Text(
-                  '${entry.value.length} open ports · Hold to copy all',
+                  entry.ports.join(', '),
+                  style: const TextStyle(fontFamily: 'monospace'),
                 ),
               ),
             ),
-            children: entry.value
+            children: entry.ports
                 .map(
                   (port) => ListTile(
-                    title: Text('TCP $port'),
-                    subtitle: Text('${serviceName(port)} · Hold to copy'),
-                    onLongPress: () =>
-                        copy(context, '$port', 'Copied port $port'),
+                    title: Text(
+                      '$port',
+                      style: const TextStyle(fontFamily: 'monospace'),
+                    ),
+                    onLongPress: () => copy('$port', 'Copied port $port'),
                   ),
                 )
                 .toList(),
           ),
-        )
-        .toList(),
-  );
+        ),
+      ],
+    );
+  }
 }
 
 class ScannedHost {
-  const ScannedHost(this.ip, this.hostname, this.ports, {this.mac = ''});
+  const ScannedHost(
+    this.ip,
+    this.hostname,
+    this.ports, {
+    this.mac = '',
+    this.checkedPorts = const [],
+  });
   final String ip;
   final String hostname;
   final List<int> ports;
   final String mac;
+  final List<int> checkedPorts;
 
   DeviceRecord toRecord() => DeviceRecord(
     ip: ip,
@@ -4440,26 +4899,63 @@ class ScannedHost {
 }
 
 ScannedHost mergePortScanObservation(
-  ScannedHost ports, {
+  ScannedHost observation, {
   ScannedHost? previous,
   DeviceRecord? saved,
 }) {
   final previousHostname = previous?.hostname ?? '';
-  final hostname = ports.hostname.isNotEmpty && ports.hostname != ports.ip
-      ? ports.hostname
-      : previousHostname.isNotEmpty && previousHostname != ports.ip
+  final hostname =
+      observation.hostname.isNotEmpty && observation.hostname != observation.ip
+      ? observation.hostname
+      : previousHostname.isNotEmpty && previousHostname != observation.ip
       ? previousHostname
       : saved?.name.isNotEmpty == true
       ? saved!.name
-      : ports.ip;
-  final mac = isUsableMacAddress(ports.mac)
-      ? normalizeMacAddress(ports.mac)
+      : observation.ip;
+  final mac = isUsableMacAddress(observation.mac)
+      ? normalizeMacAddress(observation.mac)
       : isUsableMacAddress(previous?.mac ?? '')
       ? normalizeMacAddress(previous!.mac)
       : isUsableMacAddress(saved?.mac ?? '')
       ? normalizeMacAddress(saved!.mac)
       : '';
-  return ScannedHost(ports.ip, hostname, List.of(ports.ports), mac: mac);
+  final incomingChecked = observation.checkedPorts.toSet();
+  if (incomingChecked.isEmpty) {
+    final openPorts = observation.ports.toSet().toList()..sort();
+    return ScannedHost(
+      observation.ip,
+      hostname,
+      openPorts,
+      mac: mac,
+      checkedPorts: const [],
+    );
+  }
+
+  final openPorts = {...?saved?.ports, ...?previous?.ports}
+    ..removeAll(incomingChecked)
+    ..addAll(observation.ports);
+  final checkedPorts = {...?previous?.checkedPorts, ...incomingChecked}.toList()
+    ..sort();
+  return ScannedHost(
+    observation.ip,
+    hostname,
+    openPorts.toList()..sort(),
+    mac: mac,
+    checkedPorts: checkedPorts,
+  );
+}
+
+bool addObservedOpenPorts(
+  DeviceRecord device,
+  ScannedHost observation, {
+  DateTime? observedAt,
+}) {
+  final mergedPorts = {...device.ports, ...observation.ports}.toList()..sort();
+  if (samePorts(device.ports, mergedPorts)) return false;
+  device
+    ..ports = mergedPorts
+    ..lastSeen = observedAt ?? DateTime.now();
+  return true;
 }
 
 const discoveryPorts = [
@@ -4521,7 +5017,9 @@ Future<List<ScannedHost>> discoverLan({
               ip,
             ).reverse().timeout(const Duration(milliseconds: 600))).host;
           } catch (_) {}
-          found.add(ScannedHost(ip, hostname, ports));
+          found.add(
+            ScannedHost(ip, hostname, ports, checkedPorts: discoveryPorts),
+          );
         }
         checked++;
         onProgress?.call(checked);
@@ -4534,7 +5032,13 @@ Future<List<ScannedHost>> discoverLan({
     if (entry.key.startsWith('$prefix.')) {
       foundByIp.putIfAbsent(
         entry.key,
-        () => ScannedHost(entry.key, entry.key, const [], mac: entry.value),
+        () => ScannedHost(
+          entry.key,
+          entry.key,
+          const [],
+          mac: entry.value,
+          checkedPorts: discoveryPorts,
+        ),
       );
     }
   }
@@ -4546,6 +5050,7 @@ Future<List<ScannedHost>> discoverLan({
               host.hostname,
               host.ports,
               mac: macs[host.ip] ?? host.mac,
+              checkedPorts: host.checkedPorts,
             ),
           )
           .toList()
@@ -4555,10 +5060,31 @@ Future<List<ScannedHost>> discoverLan({
 
 Future<Map<String, String>> discoverNeighborMacs() async {
   final output = StringBuffer();
-  try {
-    final arpFile = File('/proc/net/arp');
-    if (await arpFile.exists()) output.writeln(await arpFile.readAsString());
-  } catch (_) {}
+  final nativeAddresses = <String, String>{};
+  if (Platform.isAndroid) {
+    try {
+      final native =
+          await const MethodChannel(
+            'netforge/device_status',
+          ).invokeMapMethod<String, String>('getNeighborMacs') ??
+          const <String, String>{};
+      for (final entry in native.entries) {
+        if (InternetAddress.tryParse(entry.key)?.type ==
+                InternetAddressType.IPv4 &&
+            isUsableMacAddress(entry.value)) {
+          nativeAddresses[entry.key] = normalizeMacAddress(entry.value);
+        }
+      }
+    } on PlatformException {
+      // MAC discovery is best effort. Android 10+ normally returns no entries
+      // because regular apps cannot read the system neighbor table.
+    }
+  } else {
+    try {
+      final arpFile = File('/proc/net/arp');
+      if (await arpFile.exists()) output.writeln(await arpFile.readAsString());
+    } catch (_) {}
+  }
   final commands = <(String, List<String>)>[];
   if (Platform.isAndroid) {
     commands.add(('/system/bin/ip', const ['neighbor', 'show']));
@@ -4586,7 +5112,7 @@ Future<Map<String, String>> discoverNeighborMacs() async {
   for (final commandOutput in commandOutputs) {
     if (commandOutput.isNotEmpty) output.writeln(commandOutput);
   }
-  return parseNeighborMacs(output.toString());
+  return {...nativeAddresses, ...parseNeighborMacs(output.toString())};
 }
 
 String _firstAvailableExecutable(List<String> paths, String fallback) =>
@@ -4677,6 +5203,43 @@ Future<_Probe> _probe(String ip, int port) async {
   } catch (_) {
     return const _Probe(open: false, reachable: false);
   }
+}
+
+Future<DeviceCheckResult> checkHostAndListedPorts(
+  String ip,
+  List<int> listedPorts,
+) async {
+  final checkedPorts = {...discoveryPorts, ...listedPorts}.toList()..sort();
+  final ping = pingHost(ip);
+  final openPorts = <int>[];
+  var reachableOnTcp = false;
+  for (var offset = 0; offset < checkedPorts.length; offset += 96) {
+    final batch = checkedPorts.skip(offset).take(96).toList();
+    final probes = await Future.wait(
+      batch.map((port) async => (port: port, result: await _probe(ip, port))),
+    );
+    openPorts.addAll([
+      for (final probe in probes)
+        if (probe.result.open) probe.port,
+    ]);
+    reachableOnTcp =
+        reachableOnTcp || probes.any((probe) => probe.result.reachable);
+  }
+  final pingReachable = await ping;
+  final reachable = reachableOnTcp || pingReachable;
+  var mac = '';
+  try {
+    mac = (await discoverNeighborMacs())[ip] ?? '';
+  } catch (_) {
+    // Neighbor/MAC discovery is best effort and does not affect reachability.
+  }
+  return DeviceCheckResult(
+    ip: ip,
+    reachable: reachable,
+    openPorts: openPorts.toSet().toList()..sort(),
+    checkedPorts: checkedPorts,
+    mac: mac,
+  );
 }
 
 List<DeviceRecord> parseScanNotes(String text) {
