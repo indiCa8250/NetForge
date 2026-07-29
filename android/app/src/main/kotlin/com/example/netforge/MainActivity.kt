@@ -3,6 +3,7 @@ package com.example.netforge
 import android.Manifest
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -21,6 +22,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 import java.net.NetworkInterface
 
 class MainActivity : FlutterActivity() {
@@ -39,6 +41,8 @@ class MainActivity : FlutterActivity() {
                     "getStatus" -> result.success(readStatus())
                     "requestPermissions" -> requestStatusPermissions(result)
                     "getNearbyAccessPoints" -> getNearbyAccessPoints(result)
+                    "connectToAccessPoint" -> connectToAccessPoint(call, result)
+                    "getNeighborMacs" -> result.success(readNeighborMacs())
                     "openUrl" -> {
                         val url = call.argument<String>("url")
                         if (url == null ||
@@ -80,6 +84,118 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    @Suppress("DEPRECATION", "MissingPermission")
+    private fun connectToAccessPoint(call: MethodCall, result: MethodChannel.Result) {
+        val ssid = call.argument<String>("ssid")?.trim().orEmpty()
+        val requestedBssid = call.argument<String>("bssid")?.trim().orEmpty()
+        if (ssid.isEmpty()) {
+            result.error(
+                "hidden_network",
+                "Hidden networks must be connected from Android Wi-Fi settings.",
+                null,
+            )
+            return
+        }
+
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        try {
+            val current = wifi.connectionInfo
+            val currentSsid = current?.ssid?.trim('"').orEmpty()
+            val currentBssid = current?.bssid.orEmpty()
+            val exactBssidRequested =
+                requestedBssid.isNotEmpty() && requestedBssid != "02:00:00:00:00:00"
+            if (currentSsid == ssid &&
+                (!exactBssidRequested || currentBssid.equals(requestedBssid, ignoreCase = true))
+            ) {
+                result.success(
+                    mapOf(
+                        "status" to "already_connected",
+                        "confirmationRequired" to false,
+                        "message" to "Already connected to $ssid.",
+                    ),
+                )
+                return
+            }
+        } catch (_: Exception) {
+            // Android can withhold current connection details. The system Wi-Fi
+            // UI below remains the authoritative and user-controlled fallback.
+        }
+
+        val actions = buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                add(Settings.Panel.ACTION_WIFI)
+            }
+            add(Settings.ACTION_WIFI_SETTINGS)
+        }
+        for (action in actions) {
+            try {
+                startActivity(Intent(action))
+                result.success(
+                    mapOf(
+                        "status" to "settings_opened",
+                        "confirmationRequired" to true,
+                        "message" to
+                            "Android Wi-Fi controls opened. Select $ssid and confirm to connect.",
+                    ),
+                )
+                return
+            } catch (_: ActivityNotFoundException) {
+                // Try the full Wi-Fi Settings activity next.
+            } catch (_: SecurityException) {
+                // An OEM can restrict a panel action; try the standard fallback.
+            }
+        }
+        result.error(
+            "wifi_settings_unavailable",
+            "Android Wi-Fi settings could not be opened.",
+            null,
+        )
+    }
+
+    /**
+     * Best-effort legacy neighbor-cache read.
+     *
+     * Android 10 and newer blocks regular apps from /proc/net, and Android has
+     * no public replacement API that exposes arbitrary LAN peers' MAC
+     * addresses. Returning an empty map is therefore expected and must not be
+     * interpreted as proof that the peers have no MAC address.
+     */
+    private fun readNeighborMacs(): Map<String, String> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return emptyMap()
+        return try {
+            val addresses = mutableMapOf<String, String>()
+            File("/proc/net/arp").useLines { lines ->
+                lines.drop(1).forEach { line ->
+                    val columns = line.trim().split(Regex("\\s+"))
+                    if (columns.size < 4 || !isIpv4Address(columns[0])) return@forEach
+                    val flags =
+                        columns[2].removePrefix("0x").toIntOrNull(16) ?: return@forEach
+                    if ((flags and 0x2) == 0) return@forEach
+                    val mac = columns[3].replace('-', ':').uppercase()
+                    if (isUsableNeighborMac(mac)) addresses[columns[0]] = mac
+                }
+            }
+            addresses
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun isIpv4Address(value: String): Boolean {
+        val octets = value.split('.')
+        return octets.size == 4 && octets.all {
+            val octet = it.toIntOrNull()
+            octet != null && octet in 0..255
+        }
+    }
+
+    private fun isUsableNeighborMac(value: String): Boolean {
+        if (!Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$").matches(value)) return false
+        if (value == "00:00:00:00:00:00" || value == "FF:FF:FF:FF:FF:FF") return false
+        val firstOctet = value.substring(0, 2).toInt(16)
+        return (firstOctet and 1) == 0
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
